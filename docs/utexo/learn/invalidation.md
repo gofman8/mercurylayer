@@ -12,30 +12,55 @@ implementation, SuperScalar, vanilla Mercury) and states ours: **replace-by-lowe
 consensus level, over a relative-timelock (CSV) exit ladder, with the receiver's exact-equality
 census as the independent second layer.**
 
-## One protocol, two coin shapes
+> **Test evidence on this page.** The rule that removed the flat backup chain landed with
+> re-derivations of every flow whose subject it was, and those have **not been run against the
+> regtest stack yet**. Read every citation of `sdk12`, `sdk17`, `sdk30`, `sdk32`, `sdk34`, `sdk39`,
+> `sdk15`, `sdk40`, `sdk41`, `sdk42`, `sdk43`, `sdk44`, `sdk45`, `sdk46`, `sdk47`, `sdk48`,
+> `sdk50`, `sdk53`, `sdk58`, `sdk59`, `sdk60`, `sdk63`, `sdk64`, `sdk68`, `sdk82`, `sdk86`,
+> `sdk87`, `sdk88` or `RGB_E2E=4` / `RGB_E2E=7` below as **"re-derived, pending run"**. `sdk04`,
+> `sdk51`, `sdk52`, `sdk65`, `sdk66`, `sdk67`, `sdk83`, `sdk89` and `sdk94` were not touched by the
+> rule.
 
-Read this first — it decides which mechanic below applies to a given coin.
+## One protocol, one exit material
+
+Read this first — it decides which mechanic below applies to a given coin. There is no longer a
+second *shape*; there is a laddered coin and a fault.
 
 There is **one protocol**. `claim()` establishes a TES-R exit ladder — **T**rigger → **E**xtension →
-**S**tate, all relative CSV, all pre-signed and **un-broadcast** — for every fresh confirmed **root**
-coin, unconditionally. There is no protocol-version field and no escape hatch. But not every coin is
-laddered, by design:
+**S**tate, all relative CSV, all pre-signed and **un-broadcast** — for every fresh **root** coin at
+the **first mempool sighting** of its funding transaction, before confirmation. There is no escape
+hatch, and the conveyance shape field admits exactly `[2, 4]`. But not every coin ends up laddered:
 
 - **Laddered** — every plain BTC deposit, and every RGB **carrier** on a network whose enclave
   identity is pinned (there the ladder is *coloured*: every tier carries a real RGB state transition,
   so laddering moves the allocation instead of destroying it). Old state is invalidated by
   **replace-by-lower-timelock at the consensus level**, and because relative locks do not tick until
   their parent confirms, the ladder's **tiers never age**: no CSV-side expiry, **0 vB of idle rent**.
-- **FLAT-LANE** — a coin resting on the **signed-once, absolute-nLockTime backup chain**,
-  transferring by backup-chain handover. A carrier lands here wherever no enclave identity is
-  pinned: it must never be given a *plain* ladder (a plain tier spend would sweep the sats and
-  destroy the allocation — the terminal-freeze rule of [PROTOCOL.md §5.10](../spec/PROTOCOL.md),
-  pinned by `sdk52`), and the coloured ladder that would carry it safely cannot be established
-  without an identity to verify the enclave's attestation against.
+- **NO LADDER — a fault, not a lane (since 2026-09-06).** The **flat lane** — a coin resting on a
+  signed-once, absolute-nLockTime backup chain and transferring by backup-chain handover — is
+  RETIRED: no coin carries a flat backup (`create_tx1` is deleted), the conveyance shape `0` no
+  longer exists, and a coin with no ladder has no exit material and no conveyance (TRUST-MODEL B12).
+  A carrier lands there wherever no enclave identity is pinned: it must never be given a *plain*
+  ladder (a plain tier spend would sweep the sats and destroy the allocation — the terminal-freeze
+  rule of [PROTOCOL.md §5.10](../spec/PROTOCOL.md), pinned by `sdk52`), and the coloured ladder that
+  would carry it cannot be established without an identity to verify the enclave's attestation
+  against. Such a carrier holds until a later `claim()` pass colours it.
+  **And on an unpinned network it is not only carriers.** The SDK's `claim()` establish pass calls
+  `get_statechain_info` for every coin — it needs the coordinator's aggregate to bind the ladder
+  against — and that call refuses where `TesrParams::attestation_identity` can resolve neither a
+  compiled-in pin nor a configured value. The pass then records
+  `LadderSkipReason::AttestationIdentityUnpinned` and ladders **nothing**, plain deposits included,
+  while `update_coins_ex` has already booked the coin. So an SDK wallet on mainnet, testnet or
+  signet today books a deposit that can neither be conveyed nor unilaterally exited; **cooperative
+  withdrawal is its only route out**. (`coin_status::check_deposit`'s own lane,
+  `LadderAtSight::Plain`, does not call `get_statechain_info` and does ladder a plain deposit
+  without a pin — but that is the CLI/legacy-suite lane, not the one a wallet user takes.) Mainnet
+  has no enclave provisioned at all, so this is a not-yet-deployable state rather than a live
+  regression; what it is *not* is safe to restate as "deposits and exits work without a pin".
 
-The flat lane is load-bearing for RGB assets. Decrementing absolute locktimes, root deadlines
-and "materialize before the deadline" are all real mechanics — but the second and third belong to
-that shape. Which shape a carrier takes is decided by `SdkConfig::colored_ladder`, and that flag no
+The flat lane used to be load-bearing for RGB assets; decrementing absolute locktimes, root
+deadlines and "materialize before the deadline" were its mechanics, and none of them exists now —
+on any coin. Which shape a carrier takes is decided by `SdkConfig::colored_ladder`, and that flag no
 longer states a bool: both constructors READ the compiled-in pin,
 `TesrParams::attestation_identity_const`. Regtest pins the repo's own dev enclave, so it is **true**
 there; mainnet has no provisioned enclave, so the const returns `None` and the flag is **false** —
@@ -52,12 +77,11 @@ to be reached by a plain off-chain split of an un-laddered coin: `split_coin` an
 are deleted, so a coin with no ladder of any kind is now a coin to repair rather than a lane to
 route.
 
-**One correction that matters more than any other on this page.** Laddering removes the *CSV-side*
-ageing and nothing else. Every coin that has been **received** also retains its **flat backup chain**,
-whose absolute locktimes decrement by `interval` per hop, so it sits on a real approaching height
-`min(L_k)` held by its prior owners. `sdk86` measures exactly that: the tip advances toward the height
-and each hop spends `interval` of it. "An idle coin never ages" is true of the tiers and false of the
-root.
+**One correction that matters more than any other on this page — and it reversed on 2026-09-06.**
+"An idle coin never ages" is now true of the whole coin. No coin retains a flat backup chain: none is
+co-signed at deposit or at any hop, so there is no `min(L_k)` held by prior owners and
+`coin.locktime` is `None` for life (INV-5 RETIRED, INV-27 unconditional). `sdk86`, which measured the
+retained height advancing, is re-derived to assert no calendar on a received coin — pending run.
 
 ## The designs
 
@@ -67,8 +91,8 @@ root.
 | **Ark / Second** | VTXOs expire at round end; old state dies by **expiry**; the server co-signs each round's tree | Refresh each round — mandatory participation | Miss the exit window → funds sweep to the server; liveness-critical |
 | **SuperScalar** | Decker-Wattenhofer decrementing nSequence (bounded update counter) + laddered timeout trees + operator reclaim | Ladder epochs; a limited number of in-place updates | Update counter exhausts; the dying period lets the LSP claim the UTXO |
 | **Mercury (vanilla)** | Absolute decrementing nLockTime backups: the current owner's backup unlocks first | The coin ages on the calendar; an on-chain re-anchor is required to survive | Old owner + SE collusion signs anything; the ladder only orders honest broadcasts |
-| **Ours — laddered** | **Relative-CSV ladder (TES-R)**: a transfer co-signs a fresh state one δ *lower* than the one it replaces, so the current owner's state matures first; renewal replaces the whole extension horizontally at a lower CSV, making every older extension **unconfirmable** — **plus** the receiver's exact-equality census over the enclave's attested signature count | **Unbounded and off-chain**: lower-CSV extension renewal (576 hops per depth level), then off-chain self-split rollover at epoch exhaustion. The tiers never age | SE collusion with an old owner — the irreducible statechain trust unit, and it buys **no race head start**, since the collusive spend of `F` is un-timelocked and so is the owner's own trigger (`sdk15`). Otherwise a *race*, but one that cannot start until a **public on-chain trigger** gives ≥144 blocks (~1 day) of notice. The retained `min(L_k)` root height is a separate, real clock |
-| **Ours — flat lane** | Mercury's absolute nLockTime ladder (as above) **+ SE terminal-spend budget per structural node + optional single-use + optional epoch deadline** | A fresh `initlock` ladder per sub-coin — depth does NOT consume lifetime; the root deadline is real and must be beaten by materialization | Old owner + SE collusion; plus a real clawback window if nobody materializes before the deadline |
+| **Ours — laddered** | **Relative-CSV ladder (TES-R)**: a transfer co-signs a fresh state one δ *lower* than the one it replaces, so the current owner's state matures first; renewal replaces the whole extension horizontally at a lower CSV, making every older extension **unconfirmable** — **plus** the receiver's exact-equality census over the enclave's attested signature count | **Unbounded and off-chain**: lower-CSV extension renewal (576 hops per depth level), then off-chain self-split rollover at epoch exhaustion. The tiers never age | SE collusion with an old owner — the irreducible statechain trust unit, and it buys **no race head start**, since the collusive spend of `F` is un-timelocked and so is the owner's own trigger (`sdk15`). Otherwise a *race*, but one that cannot start until a **public on-chain trigger** gives ≥144 blocks (~1 day) of notice. There is no other clock: no flat backup chain exists (2026-09-06) |
+| **Ours — flat lane (RETIRED 2026-09-06)** | *(Was: Mercury's absolute nLockTime ladder + SE terminal-spend budget per structural node + optional single-use + optional epoch deadline.)* No coin carries it; the SE-side budget, single-use and `epoch_deadline` gates survive on every coin | *(Was: a fresh `initlock` ladder per sub-coin; a root deadline beaten by materialization.)* Nothing — there is no chain to renew | *(Was: a clawback window if nobody materialized before the deadline.)* Removed: no prior owner holds a matured spend of `F` |
 
 **Why relative locks at all.** Absolute timelocks age while un-broadcast, so the defence has to be
 renewed on the calendar: ~112 vB per coin per epoch is **~5,840 vB per coin-year**, which is ~11% of
@@ -77,8 +101,8 @@ un-broadcast transactions **do not tick until a parent confirms**, so the clock 
 rather than on deposit. That single substitution is what deletes the CSV-side rent. Full arithmetic:
 [PROTOCOL.md §2](../spec/PROTOCOL.md).
 
-**What it does not delete.** It does not delete `min(L_k)`, and it does not make the ladder free at
-the *payment* layer — see [Exit economics](#exit-economics-the-honest-ledger), which is the section
+**What it does not delete.** It does not make the ladder free at the *payment* layer (there is no
+`min(L_k)` left to delete — the flat chain is gone, 2026-09-06) — see [Exit economics](#exit-economics-the-honest-ledger), which is the section
 to read before quoting any ratio.
 
 ## Our model, precisely
@@ -89,7 +113,7 @@ The funding UTXO **F** is the only thing on-chain. Above it sits a pre-signed, u
 
 ```
 F  (on-chain)
-└─ T   TRIGGER    — v3/TRUC + P2A, NO timelock, signed ONCE at deposit, never re-signed
+└─ T   TRIGGER    — v3/TRUC + P2A, NO timelock, signed ONCE at first sight of F, never re-signed
    └─ X_m  EXTENSION  — relative CSV E_m = 720 − m·36; renewal replaces it horizontally
       └─ S_k  STATE   — relative CSV Δ_k = 1440 − k·36; decrements once per transfer
 ```
@@ -105,7 +129,7 @@ that schedule alone.
    (replace-by-lower-timelock, Decker-Wattenhofer at one dedicated tier). The superseded state is
    **disclosed** to the receiver and counted: `verify_bundle_bound`
    (`clients/libs/rust/src/tesr.rs`) enforces the exact equality
-   `se_num_sigs == flat_backups + tiers + superseded`, so a hidden extra co-signed state shows up as
+   `se_num_sigs == tiers + superseded` (flat term zero by construction), so a hidden extra co-signed state shows up as
    a count mismatch. Evidence: `sdk40` PART 2 (a stale ladder dies outright at consensus once its
    prevout is gone), `sdk41` (after a transfer the receiver co-signs and exits a full ladder over the
    same funding outpoint while the sender is locked out), `sdk46` / `sdk47` (the census against the
@@ -126,13 +150,14 @@ that schedule alone.
    start counting once the parent confirms. So an idle ladder — and an entire idle split DAG — never
    ages on the CSV side. `sdk40` PART 1 shows real consensus enforcing it: an extension is rejected
    before `E_m` confirmations of T, a state before `Δ_k` of X.
-5. **But the coin still has a root clock.** `min(L_k)` over the retained flat backup chain is an
-   absolute height held by prior owners; when it passes, an ancestor's matured rung can spend `F`.
-   `deadline_safety_due` (`clients/libs/rust-sdk/src/refresh.rs`) is the only scheduled defence: at
-   `auto_refresh_margin_blocks` = 144 it re-anchors cooperatively first and, if refused, **severs
-   from `F`** by broadcasting the already-co-signed trigger — which carries no timelock and so beats
-   every retained *timelocked* rung by being valid first. A defence the adversary can decline by not
-   co-signing is not a defence, hence the fallback.
+5. **The coin has no root clock — RETIRED 2026-09-06.** *(Was: `min(L_k)` over a retained flat
+   backup chain, an absolute height held by prior owners, defended by `deadline_safety_due` with
+   `sever_from_f` as its fallback.)* No coin carries a flat backup, so no ancestor holds a matured
+   rung and `coin.locktime` is `None` for life. `deadline_safety_due`
+   (`clients/libs/rust-sdk/src/refresh.rs`) still runs and has no laddered subject — its
+   due-predicate reads `coin.locktime`. `sever_from_f` survives as an on-demand move: broadcasting
+   the un-timelocked trigger yourself pre-empts every other spend of `F`, and the only other spends
+   in anyone's hands are copies of that same trigger and superseded states that lose the CSV race.
 6. **The honest defence is a walk, not a race to broadcast one tx.** A unilateral exit broadcasts the
    tiers in order, waiting out each relative timelock (`sdk50`; the keyless tower does the same walk
    in `sdk45` / `sdk51`). If someone hostile broadcasts T first, the owner answers with a
@@ -150,35 +175,23 @@ that schedule alone.
    anchor) while costing the attacker nothing.
 7. **`refresh` is the re-anchor primitive, not a deadline reset.** One on-chain transaction moves the
    coin to a fresh funding outpoint and mints a new ladder at depth 0 (`sdk30` covers the user-paid
-   and operator-sponsored fee models). It buys a fresh epoch and resets depth; it does not buy
-   CSV-side lifetime, because there is none to buy.
+   and operator-sponsored fee models). It resets depth and the hop budget; it buys no calendar, because there is none (2026-09-06).
 
-### Flat-lane coins (RGB carriers where no enclave identity is pinned)
+### Flat-lane coins — RETIRED 2026-09-06
 
-Mercury-native: the first backup unlocks at `tip + initlock`; every transfer hands the new owner a
-backup unlocking `interval` earlier, so the current owner always wins an honest exit race. Each
-sub-coin gets a **fresh** `tip + initlock` ladder at creation — splitting does not spend the
-children's lifetime, unlike a tree that shares one decrementing budget.
-
-The pair is compiled into the client, not served by the SE:
-`TesrParams::flat_ladder_params` (`lib/src/tesr.rs`) gives **10,000 / 100** on mainnet, testnet and
-signet and **1,000 / 10** on regtest — 100 hops of ladder capacity either way. It has to come from
-somewhere neither the sender nor the coordinator chooses, because the per-hop decrement *is* the
-defence against a padded backup vector: `/info/config` still publishes both, but only as a
-cross-check the client refuses to proceed past on mismatch.
-
-Because these locktimes are absolute, this shape **does** keep a root deadline: a received carrier
-owes one materialization — broadcast the coloured branch only, never the sats-sweeping backup — before
-an ancestor's stale backup matures. `auto_exit_due` (default on) does it automatically, using the
-deposit-anchored `exit_deadline_block` from `estimate_exit_cost`. Evidence: `sdk34` (a watchtower
-materializes a carrier before its deadline), `sdk32` (the residual clawback window if nobody does),
-`sdk39` (depth-2 coloured branch exit, allocation preserved).
-
-The margin is **derived, not chosen**:
-`auto_exit_margin_blocks_for(k_max, interval, d) = k_max·interval + tesr_exit_txs(d)·144`
-(`clients/libs/rust-sdk/src/config.rs`) — **2,120 blocks on mainnet**, **860 on regtest**. The second
-term is one confirmation window per *sequential* transaction of the exit walk, not a single window for
-the whole thing.
+*(This section described RGB carriers on a network with no pinned enclave identity as Mercury-native
+coins: a first backup unlocking at `tip + initlock`, each transfer handing the new owner a backup
+`interval` earlier, a fresh `tip + initlock` ladder per sub-coin, a root deadline a received carrier
+had to beat by materializing its branch, `auto_exit_due` doing so against a deposit-anchored
+`exit_deadline_block` at a margin `auto_exit_margin_blocks_for(k_max, interval, d)`, with `sdk34`,
+`sdk32` and `sdk39` as evidence.)* None of it is built any more. No coin carries a flat backup, so a
+carrier that cannot be coloured has **no exit material** rather than a deadline (TRUST-MODEL B12);
+`initlock` / `interval` survive in `TesrParams::flat_ladder_params` (`lib/src/tesr.rs`) and
+`/info/config` only as compatibility constants — `initlock` is the fixed exit window of the
+split-depth cap, `interval` is applied to nothing — and the client still refuses a coordinator whose
+copy disagrees. `auto_exit_due` keeps a legacy subject only (`branch-` rows from before the rule);
+its margin is still derived but sizes nothing on any coin the code can mint. `sdk34`, `sdk32` and
+`sdk39` are re-derived to the event-driven defence, pending run.
 
 And when the pass cannot compute a deadline it says so rather than concluding "nothing is due":
 `ExitCostEstimate::exit_deadline_blind` separates "this coin genuinely has no deadline" from "I could
@@ -204,8 +217,8 @@ bundle.
    present **and** `num_sigs ≥ budget` — for the parent and every intermediate segment, keeping the
    coordinator's answer only as a cross-check that refuses on disagreement.
 2. **The ladder as fallback.** Even if the SE misbehaved, the parent's remaining pre-signed state is
-   ordered *below* the child's in the timelock race (laddered), or locktimed above the locktime-free
-   branch (flat lane) — an honest receiver who exits in time wins. Refusal (instant, no race) plus
+   ordered *below* the child's in the timelock race (laddered), *(the flat-lane form — locktimed above a
+   locktime-free branch — is retired)* — an honest receiver who exits in time wins. Refusal (instant, no race) plus
    timelocks (race, bounded).
 
 **What is deliberately not claimed:** there is no enclave "single-active-state" refusal. The enclave
@@ -252,8 +265,8 @@ ladder via a HODL-invoice latch (`sdk63` pay, `sdk64` / `sdk67` receive, `sdk65`
 - **Decker-Wattenhofer**: replace-by-lower-timelock, applied at one dedicated tier, so tree depth
   stays constant across all epochs instead of exhausting an update counter.
 - **Mercury**: the pre-signed, SE-independent exit as the trustless floor under everything, and the
-  absolute-locktime ladder itself, which remains the invalidation mechanism for the flat lane
-  and the retained root clock on every received coin.
+  absolute-locktime ladder itself as the historical reference — it is no longer the mechanism of any
+  coin here (the flat lane and its root clock are retired, 2026-09-06).
 - **Rejected**: revocation keys (they grow the collusion surface), mandatory round refresh (a liveness
   cliff), bounded DW update counters, and shared-UTXO factories — an operator-chooseable n-of-n root
   that never rotates, whose cohort can fresh-spend the root and confiscate every leaf below, including
@@ -277,16 +290,17 @@ piece plus change, chainable to depth, each piece a full coin. The mechanics dif
   `sdk58` (one real child accepted, every tampered one rejected for the *named* reason it targets)
   and driven end to end by `sdk59`.
 - **Depth is capped, and the cap is derived rather than a literal.**
-  `max_split_depth(base, per_level, epoch_blocks)` (`lib/src/transfer/receiver.rs`) searches against
-  the admission rule the receiver actually applies, so the build side can never mint a depth no
-  receiver could adopt. On mainnet it is **8**, giving `max_exit_txs` = **19 transactions**; on
+  `max_split_depth(base, per_level, epoch_blocks)` (`lib/src/transfer/receiver.rs`) — evaluated at
+  `epoch_blocks = initlock`, a fixed exit window and not a calendar — searches against the admission
+  rule the receiver actually applies, so the build side can never mint a depth no receiver could
+  adopt. On mainnet it is **8**, giving `max_exit_txs` = **19 transactions**; on
   regtest **54** and 111. `enforce_split_depth_cap_shaped` (`clients/libs/rust/src/tesr.rs`) is the
   gate, and every input it uses is receiver-derived — a schedule the sender declares would let it
   inflate its own cap.
-- **Flat lane — the coloured / backup-chain split.** 1-sat resolution above the 330-sat
-  `DUST_LIMIT`, with each piece additionally funding its own backup. Token pieces are packaged at
-  `tokens::TOKEN_PIECE_SATS` = **4,074 sat**, derived so a received piece can still carry a full
-  coloured rung rather than stranding at the floor.
+- **Flat lane — the coloured / backup-chain split — RETIRED 2026-09-06.** *(Was: 1-sat resolution
+  above the 330-sat `DUST_LIMIT`, each piece funding its own backup.)* `register_split_subcoins_n`
+  refuses by name. Token pieces are still packaged at `tokens::TOKEN_PIECE_SATS` = **4,074 sat**,
+  derived so a received piece carries a full coloured rung rather than stranding at the floor.
 
 Exact bounds, token packaging and pricing: the [granularity deep dive](granularity-deep-dive.md) and
 [PARTIAL-PAYMENT-ECONOMICS.md](../spec/PARTIAL-PAYMENT-ECONOMICS.md).
@@ -301,7 +315,7 @@ we lose:
 | leaf lane, per payment | block space | against ~154 vB on chain |
 |---|---:|---|
 | spent onward off-chain | **0 vB** | this is the product |
-| swept and settled | **~105 vB** | **1.47× better — the cap without the discharge round** |
+| swept and settled | **~105 vB** | **1.47× better — the cap for a leaf settled on its own, i.e. without a close** |
 | walked out unilaterally | **250 – 2,719 vB** | worse than on-chain |
 | **shipped default** | **418 vB** | **2.7× worse** |
 
@@ -320,27 +334,37 @@ ratio derived against N separate payments is measuring an opponent that does not
 
 What the design sells is **velocity, not granularity** — every payment *after* the first costs another
 ~154 vB on chain and zero off chain. The design rule follows: a piece received and immediately cashed
-out should never have been an off-chain split. The **discharge round**
-([SPEC.md §5.4](../spec/SPEC.md)) is what would change this by an order of magnitude, and it is
-**design, not built**: its SE enforcement point is empty.
+out should never have been an off-chain split. What retires a whole tree for one transaction is the
+**close** ([SPEC.md §5.4](../spec/SPEC.md)), and this page previously described it wrongly: the
+*discharge round* — the R0–R9 sequence, round eligibility and the operator float — was **deleted from
+the design**, not left unbuilt (§5.4.7; ci-guard `deny_round_shaped_mechanisms`, REQ-81: a close is a
+root owner's decision, never a calendar's). The owner-triggered close that replaced it **is** built
+on both sides — `collapse_obligations` / `collapse_first` / `collapse_grant` / `request_collapse` in
+the client, and the REQ-56 predicate enforced inside the enclave (`lockbox/include/registry.h`,
+`db_manager.h`'s `freeze_root_and_store_collapse_sig`, the `/collapse_grant` route in
+`lockbox/src/server.cpp`), which refuses any `C` that does not pay every unreleased frontier leaf its
+full funding value to its own exit key. `sdk94` drives the accept path end to end. What does not
+exist is a *scheduler*: nothing closes a tree for you, so the per-payment figures above are the
+one-leaf-at-a-time numbers.
 
 The per-coin exit shape, for reference:
 
 | Coin | Exit txs | vsize | Fee model | Wait |
 |---|---|---|---|---|
-| **Laddered, flat** | 3 pre-signed tiers (T → X_m → S_k) | **375 vB** (3 × `TIER_VBYTES`); up to ~834 vB with a P2A fee child on each tier in a spike | each tier carries a **committed** fee at `committed_fee_rate` (3.0 sat/vB, fixed at signing) and relays standalone; in a spike attach a ~153-vB P2A child per tier at the market rate | sequential relative CSV, `E_m` then `Δ_k`: worst **2,160 blocks ≈ 15 d** on a fresh mainnet coin, plus one confirmation per tier, shrinking 36 blocks per hop and per renewal. The clock starts only when T is broadcast |
+| **Laddered root (depth 0)** | 3 pre-signed tiers (T → X_m → S_k) | **375 vB** (3 × `TIER_VBYTES`); up to ~834 vB with a P2A fee child on each tier in a spike | each tier carries a **committed** fee at `committed_fee_rate` (3.0 sat/vB, fixed at signing) and relays standalone; in a spike attach a ~153-vB P2A child per tier at the market rate | sequential relative CSV, `E_m` then `Δ_k`: worst **2,160 blocks ≈ 15 d** on a fresh mainnet coin, plus one confirmation per tier, shrinking 36 blocks per hop and per renewal. The clock starts only when T is broadcast |
 | **Laddered, in-ladder child at depth d** | `3 + 2d` | `293·d + 375` vB | as above | `720·d + 2,160` CSV blocks plus one confirmation per transaction; depth cap 8 on mainnet |
-| **Flat-lane carrier** | 1 (backup) | decoded from the stored pre-signed tx | committed at co-sign; CPFP-bumpable from the backup's own output | absolute nLockTime: ≤ `initlock` (10,000 blocks on mainnet), −`interval` per handover |
-| **Flat-lane, depth-N sub-coin** | N + 1 (N branch txs + backup) | decoded from the stored pre-signed txs | branch fees pre-committed by the splitter; backup as above | the branch is locktime-free and confirms immediately; the backup then waits from the split tip |
+| **Flat-lane carrier — RETIRED 2026-09-06** | 0 — no backup exists; a carrier with no coloured ladder has no exit material | — | — | *(was: absolute nLockTime ≤ `initlock`, −`interval` per handover)* |
+| **Flat-lane, depth-N sub-coin — RETIRED 2026-09-06** | none minted; a legacy `branch-` sub-coin from before the rule still materialises its branch (a settlement, not an exit) | decoded from the stored pre-signed txs | branch fees pre-committed by the splitter | *(was: a locktime-free branch, then the backup's wait)* |
 
-`estimate_exit_cost` returns the real numbers rather than a model — it decodes the stored pre-signed
-transactions and reports `branch_txs`, `branch_vbytes`, `backup_vbytes`, `total_vbytes`,
-`fee_sats_at(rate)`, `wait_blocks` (when the exit *completes*) and `exit_deadline_block` (the *safety*
-deadline, the number a watchtower must act on), with `exit_deadline_blind` naming why a deadline could
-not be computed. `unilateral_exit` handles both shapes without the caller choosing: on a laddered coin
-it walks the tier chain idempotently, advancing as far as maturity allows and reporting the blocks
-left until the next tier matures; on a flat-lane coin it broadcasts the locktime-free branch
-immediately and reports the remaining backup wait instead of failing.
+`estimate_exit_cost` returns the real numbers rather than a model — for a laddered **root**
+`backup_vbytes` is the signed vsize of the tier walk (it is `0` for a `ctesr-` child or a
+`spinetip-` tip, whose cost is `tesr_exit_vbytes(d)` above, because the call looks up a `tesr-` row
+and there is none), `wait_blocks` is 0 while idle, and
+`exit_deadline_block` is `None` — and since 2026-09-06 that `None` IS the statement that the coin has
+no calendar (`exit_deadline_blind` still names a lookup that could not be made, which is blindness
+and never "nothing due"). `unilateral_exit` walks the tier chain idempotently, advancing as far as
+maturity allows and reporting the blocks left until the next tier matures; a coin with no ladder is
+refused by name — there is no flat fallback.
 
 ## The traded property, stated plainly
 
@@ -354,9 +378,13 @@ Two limits belong in the same breath, because they are protocol facts and not im
 keyless tower **cannot fee-bump** a tier stuck under a risen relay floor (a CPFP child needs an input
 it does not hold), so above that floor the defence falls back to the owner being online or to an
 operator's funded-tower variant — and `SdkConfig::fee_bump` ships as `None` on both presets. And a
-keyless tower **does not cover the root clock**: a laddered entry is exported with
-`deadline_block: u32::MAX`, so a delegate watches only the event of `F` being spent, while
-re-anchoring needs the owner's keys.
+keyless tower **cannot re-anchor** — that needs the owner's keys. A third limit is narrower but
+belongs here too: a delegate covers what the bundle carries, and `export_watch_bundle` emits an
+entry only for a **laddered** coin. A coin with no ladder is skipped, and so, since the
+height-driven arm was deleted, is a legacy `branch-` coin — neither is a coin a tower can help, but
+neither is visible in the bundle either. There is no root clock left for it
+to miss: every entry is exported with `deadline_block: u32::MAX` and a trigger on `F`, and the event
+of `F` being spent is the whole duty (2026-09-06).
 
 See [TRUST-MODEL.md](../spec/TRUST-MODEL.md) for the full boundary list and
 [PROTOCOL.md §5.13](../spec/PROTOCOL.md) for the watchtower's normative limits.

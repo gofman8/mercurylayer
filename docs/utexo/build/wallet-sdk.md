@@ -25,21 +25,23 @@ F (on-chain funding, 2-of-2 owner+SE)
 
 Four consequences the API depends on:
 
-- **An idle coin never ages on the CSV side.** BIP-68 relative timelocks only start counting once
+- **An idle coin never ages.** BIP-68 relative timelocks only start counting once
   the parent confirms, and `T` has no timelock, so nothing matures until someone broadcasts `T`.
   0 vB of idle rent.
-- **A coin still has one absolute calendar.** Alongside the tiers, the coin retains a **flat backup
-  chain** over `F` with *absolute* locktimes `L_k = L_0 − k·interval`, and prior owners hold rungs of
-  it. `min(L_k)` is the coin's **epoch expiry**: once that height passes, an ancestor's matured rung
-  can spend `F` and take the coin. Mining consumes it, and each whole-coin hop consumes `interval`
-  more. This is why `deadline_safety_due` runs unconditionally in `start_background()` — see
-  [Maintenance](#maintenance-and-watchtowers). Do not build UI that says a laddered coin cannot
-  expire.
+- **A coin has no other clock (since 2026-09-06).** There is no flat backup chain beside the tiers:
+  no absolute-locktime backup is co-signed at deposit (`create_tx1` is deleted) or at any hop, so
+  there are no locktimes `L_k`, no `min(L_k)` held by prior owners, no epoch expiry, and
+  `coin.locktime` is `None` for life. Nothing on a coin matures on its own (INV-27, unconditional).
+  `deadline_safety_due` still runs unconditionally in `start_background()` and has no laddered
+  subject — see [Maintenance](#maintenance-and-watchtowers). A laddered coin cannot expire; what
+  bounds its off-chain life is the renewal/rollover hop budget, and the on-chain cadence is the
+  cooperative re-anchor at that cap.
 - **A transfer co-signs a fresh state one δ *lower*** than the one it replaces, so the new owner's
   state matures first; the superseded state is disclosed and counted by the receiver's census.
   Nothing goes on-chain.
 - **Renewal and rollover are off-chain and unbounded.** `refresh` is the on-chain **re-anchor**
-  primitive — one transaction that moves the coin to a fresh outpoint and mints a fresh flat chain.
+  primitive — one transaction that moves the coin to a fresh outpoint, where a brand-new LADDER is
+  established at first sight of the new funding transaction. There is no flat chain for it to mint.
 
 **Three laddered shapes coexist in the API**, and they are the whole routing table:
 
@@ -62,17 +64,23 @@ stronger than a refusal inside one function.
 and therefore cannot root a trigger — colouring a tier cannot broadcast a funding output. Every
 in-ladder split child and every spine-tip change leg still has un-broadcast funding; that is what the
 whole design exists to produce, and it is where the 0 vB of idle rent comes from. Coins whose only
-exit material is a `branch-` chain still exist — the legacy coloured split/combine lane still carves
-them where `colored_ladder` is off — and every exit path still reads those rows.
+material is a `branch-` chain still exist **from before 2026-09-06**, but nothing carves new ones:
+`refuse_legacy_colored_split_lane` refuses on BOTH settings of `colored_ladder`, ahead of
+`register_split_subcoins_n` / `register_combine_subcoins`, which refuse by name too. And a `branch-`
+chain is no longer exit material: `has_exit_material` counts ladders only, `unilateral_exit` has no
+arm that broadcasts one, and `export_watch_bundle` omits such a coin. The rows are still READ by
+`materialise_carrier`, by `withdraw`'s pre-spend materialisation, and by `auto_exit_due`'s legacy
+loop — settling an allocation on chain, never exiting a coin.
 
 `ParentShape` (`clients/libs/rust-sdk/src/transfer.rs`) is the single resolution of that question,
-and it selects the route AND the value floor together — so `quote_transfer` and `transfer` cannot
+and it selects the route AND the value floors together — so `quote_transfer` and `transfer` cannot
 answer differently. It now **refuses** rather than returning a shape when a coin carries no ladder of
 any kind: with one coin shape that is a fault to report, not a lane to pick, and the refusal names
 `claim()` and `ladder_skip_reason` as the remedy. (`parent_shape_opt` is the probe form, where
-absence is data rather than an error — `has_exit_material` needs it, because a coin carrying only
-flat backup rows can still be exited and erroring there would drop a spendable coin out of the
-balance.) It is an internal type: an app never names a shape, it calls `transfer` and reads the
+absence is data rather than an error — `has_exit_material` needs it, so that a coin with no ladder reads as having no exit
+material instead of erroring the balance. `has_exit_material` now answers from `parent_shape_opt`
+**and nothing else**: it used to count a legacy flat backup row as exit material, which put coins in
+`quote_transfer`'s `fundable` set that the executor then refused.) It is an internal type: an app never names a shape, it calls `transfer` and reads the
 outcome.
 
 ## Create / restore
@@ -90,9 +98,9 @@ let (wallet, _) = UtexoWallet::initialize(SdkConfig::regtest("alice"), Some(&mne
 > ⚠️ **The mnemonic ALONE is not a sufficient backup.** It restores the key hierarchy, but off-chain
 > funds are only safe if you can *exit* them, and the exit material lives ONLY on your disk — the SE
 > cannot re-serve it after a claim. That is the pre-signed tier chain (`tesr-*` for a root coin,
-> `ctesr-*` for a received child, `spinetip-*` for a change tip), the flat backup chains and the
-> exit branches of every off-chain sub-coin (`branch-*` — a sub-coin whose funding is un-broadcast
-> **cannot be exited at all** without them), the terminal-ancestor lists (`parents-*`), and — for token
+> `ctesr-*` for a received child, `spinetip-*` for a change tip), the legacy `branch-*` rows and
+> `parents-*` lists of any coin that predates 2026-09-06 (no flat backup chain exists for any coin
+> minted since), and — for token
 > wallets — the entire RGB stash under a *separate* `rgb.mnemonic` inside `rgb_data_dir`. **Losing
 > `wallet.db` or `rgb_data_dir` is total loss of every off-chain coin and token, even with the
 > mnemonic.**
@@ -122,11 +130,11 @@ Behaviour knobs and their shipped defaults:
 
 | Field | `regtest` | `mainnet` | What it does |
 |---|---|---|---|
-| `auto_refresh` | `true` | `true` | Run the pre-spend re-anchor hook inside `transfer` / `transfer_many`, so a coin near its flat-chain floor is refreshed before it is selected. |
-| `auto_refresh_margin_blocks` | `144` | `144` | Headroom at which that hook — and the background `deadline_safety_due` pass — fires. Must exceed the SE `interval` so a whole-coin handover still validates. |
+| `auto_refresh` | `true` | `true` | Run the pre-spend re-anchor hook inside `transfer` / `transfer_many`. **Inert on a laddered wallet** (2026-09-06): its due-predicate reads `coin.locktime`, which is `None` for life, so nothing is ever selected. |
+| `auto_refresh_margin_blocks` | `144` | `144` | The margin that hook — and the background `deadline_safety_due` pass — compares a coin's `locktime` against. No laddered coin has one, so neither pass has a subject; kept as the argument they take. |
 | `background_auto_refresh` | `false` | `false` | **Read by nothing at runtime.** `maintenance_plan` returns `MaintenancePass::DeadlineSafety` unconditionally, so deadline defence is never gated on an economics flag. Kept as a field; do not build behaviour on it. |
 | `auto_exit` | `true` | `true` | Run the `auto_exit_due` watchtower pass from the background watcher. |
-| `auto_exit_margin_blocks` | `860` | `2_120` | **Derived, not chosen** — `auto_exit_margin_blocks_for(AUDIT_17_K_MAX, interval, AUTO_EXIT_MODELLED_DEPTH)` = `k_max·interval + tesr_exit_txs(d)·144`. The two networks differ because the SE `interval` does (10 vs 100). |
+| `auto_exit_margin_blocks` | `860` | `2_120` | **Derived, not chosen** — `auto_exit_margin_blocks_for(AUDIT_17_K_MAX, interval, AUTO_EXIT_MODELLED_DEPTH)` = `k_max·interval + tesr_exit_txs(d)·144`; the networks differ because `interval` does (10 vs 100). Consumed only by the legacy `branch-` loop of `auto_exit_due`: no laddered coin has a height deadline (`deadline_block: u32::MAX`) and the leaf near-deadline loop is deleted (2026-09-06). |
 | `fee_bump` | `None` | `None` | `Some(FeeBumpConfig{..})` gives `unilateral_exit` / `defend_ladders` a fee float and a Core RPC endpoint so a tier stuck under the relay floor can be escalated to a 1P1C package. `None` means the wallet **cannot** bump and says so rather than retrying at the committed rate forever. The key funds fees only — never a coin key. |
 | `colored_ladder` | `true` | `false` | **Derived, not stated.** Both constructors READ `mercurylib::tesr::TesrParams::attestation_identity_const` for the network instead of carrying a literal, because the coloured lane establishes its ladders through `claim()` and `claim()` refuses without a pinned attestation identity — true-without-a-pin would ship a wallet whose token lane refuses permanently behind a message saying a later `claim()` will fix it, and that message is a lie no code can make true. Regtest has a compiled-in pin, so it is **on** and a carrier is laddered like any other coin. Mainnet is **off** only because no mainnet enclave is provisioned; pin one and this flips itself. See [Tokens](#tokens). |
 | `attestation_identity` | `None` | `None` | The enclave identity a laddering claim verifies sig-count attestations against. Resolution is **compiled-in pin → this field → `UTEXO_ATTESTATION_IDENTITY` → refuse**. Regtest now ships a compiled-in pin (the identity derived from the dev seed this repo commits), and a pin is **not overridable** — a value here that disagrees with it is an error, not an override. With no pin available at all, `claim()` records `LadderSkipReason::AttestationIdentityUnpinned` and establishes no ladder — the correct direction to fail. |
@@ -161,9 +169,12 @@ let coins = wallet.list_coins().await?;
 
 `get_balance` **fails closed** on a token wallet whose RGB state cannot be read: counting a carrier's
 sats as spendable BTC would invite an allocation-destroying spend, so it returns `Err` rather than a
-plausible number. `CoinInfo::off_chain` is true when the coin's funding transaction is un-broadcast
-(an in-ladder child, a spine tip, or a sub-coin carved on — or received from — the legacy coloured
-split/combine lane, which is the only lane that still calls `register_split_subcoins`).
+plausible number. `CoinInfo::off_chain` is true **only when the coin still holds a `branch-` row** from the retired
+coloured split/combine lane — that is literally what `list_coins` computes (`read_exit_branch(sid)`
+non-empty), and the read propagates its errors rather than reporting an unreadable row as on-chain.
+An in-ladder child and a spine tip also have un-broadcast funding and are nevertheless reported
+`off_chain: false`, because neither has such a row. Do not use this field as "is this coin's funding
+un-broadcast"; use the coin's shape.
 
 Two queries answer *"can this coin be conveyed on the ladder lane?"* from persisted state, which is
 the authority — the `LadderSkipped` event is transition-only and an app that starts late never sees
@@ -172,14 +183,18 @@ it:
 ```rust
 let reason: Option<LadderSkipReason> = wallet.ladder_skip_reason(&statechain_id).await;
 let raw:    Option<String>           = wallet.ladder_skip_reason_raw(&statechain_id).await;
-// (statechain_id, reason_string, permits_flat_conveyance) for every flat-only coin
+// (statechain_id, reason_string, may_still_be_transferred — always false since 2026-09-06) per coin with no ladder
 let flat: Vec<(String, String, bool)> = wallet.flat_only_coins().await?;
 ```
 
-`LadderSkipReason::permits_flat_conveyance()` is a **prediction**, not the decision — the authority
-is `mercuryrustlib::transfer_sender::assert_flat_conveyance_is_legitimate`, which re-proves the
-licence from live evidence at conveyance time. `false` is reliable; `true` means "provided the
-evidence is still there".
+`LadderSkipReason::permits_flat_conveyance()` answers `false` for every reason (2026-09-06): there is
+no flat conveyance for it to permit — `assert_flat_conveyance_is_legitimate` is deleted (the symbol
+no longer exists), `is_legitimate_flat_reason` is a function that returns `false` unconditionally,
+and `transfer_sender::execute_ex` refuses a coin with no ladder row by name. A recorded reason is
+diagnostic, never a licence; the remedy is another `claim()` pass. One reason is not a *missing*
+ladder but a *wrong* one, and it has no remedy at all: `PlainLadderOverCarrier` means tokens landed
+on an already-plain-laddered outpoint, `colored_reanchor` refuses a plain ladder by name and a plain
+`refresh` would destroy the allocation, so the allocation is stranded.
 
 ## Deposit
 
@@ -187,13 +202,27 @@ evidence is still there".
 let addr = wallet.get_deposit_address(100_000).await?;  // fund with exactly 100k sats
 ```
 
-The background watcher detects and confirms it (`DepositConfirmed`). At `claim()` the coin is
-laddered — `T`, `X_0` and `S_0` are built and co-signed, and `LadderEstablished` fires. Nothing is
-broadcast; the coin sits off-chain. Laddering is attempted for every fresh confirmed root coin
-(`sdk71`); when it cannot be done the reason is recorded and surfaced as `LadderSkipped` +
-`ladder_skip_reason`, and some reasons are permanent for the coin (`RgbCarrier`,
-`FundingNotOnChain`, `DuplicateDeposit`, `AttestationIdentityUnpinned`) while others clear on a later
-pass (`CoordinatorUnavailable`, `FundingUnresolvable`, `RgbStateUnavailable`).
+The background watcher detects it (`DepositConfirmed`). At `claim()` the coin is laddered — `T`,
+`X_0` and `S_0` are built and co-signed, and `LadderEstablished` fires. Nothing is broadcast; the
+coin sits off-chain. **This happens at the first mempool sighting, not at confirmation**: the
+establish pass runs over every un-laddered `IN_MEMPOOL` / `UNCONFIRMED` / `CONFIRMED` root coin
+(`sdk71`, run and passing per `dd03ab2`), and the trigger needs only the funding outpoint, its value
+and the aggregate key. When it cannot be done the reason is recorded and surfaced as `LadderSkipped`
++ `ladder_skip_reason`. Some reasons are permanent for the coin (`RgbCarrier`, `FundingNotOnChain`,
+`DuplicateDeposit`, `AttestationIdentityUnpinned`, `AttestationInvalid`, `BindingUnresolved`,
+`PlainLadderOverCarrier`), others clear on a later pass (`CoordinatorUnavailable`,
+`FundingUnresolvable`, `RgbStateUnavailable`, `EstablishFailed`).
+
+⚠️ **`AttestationIdentityUnpinned` is the one to design around.** A pin exists only for regtest —
+`TesrParams::attestation_identity_const` is `None` for mainnet/bitcoin and for testnet, testnet3,
+testnet4 and signet — and the establish pass needs the attested `get_statechain_info`, so on any of
+those it ladders **nothing**. The deposit is still booked, and it then has **no exit material at
+all**: it cannot be conveyed and it cannot be unilaterally exited, so cooperative withdrawal is the
+only route out. The flat backup used to give it a unilateral exit needing no attestation; it is gone.
+This is a not-yet-deployable state, not a live regression — no mainnet enclave is provisioned. Note
+also that this is the SDK `claim()` lane only: `coin_status::check_deposit` under
+`LadderAtSight::Plain` ladders without consulting any pin, because `tesr::establish_auto` and
+`cosign_tier` never call `get_statechain_info`.
 
 Each fresh **on-chain onboarding** slot consumes an SE deposit token. The SDK fetches one; if the SE
 charges you get `SdkError::TokenPaymentRequired { token_id, deposit_address, fee_sats }` — pay it and
@@ -220,15 +249,12 @@ let r = wallet.transfer(&bob_address, 15_000).await?;
 
 1. **Exact subset** — a subset of confirmed coins sums to the amount and each is handed over whole.
    A laddered coin co-signs a fresh lower-CSV state; a received child goes through
-   `mercuryrustlib::tesr::child_retransfer`; a coin with no ladder does a backup-chain handover via
-   `transfer_sender::execute`, but only if `assert_flat_conveyance_is_legitimate` can PROVE from live
-   evidence that it is legitimately flat. Two of the licences it used to grant are retired with the
-   un-laddered shape: "this coin is an RGB carrier" (a carrier is laddered now) and "this coin's
-   funding is not on chain" (the split sub-coin that reason described has no producer left). What
-   remains is a terminalized carrier, proven from the coin's own `single_use` flag; a pre-0009
-   no-aggregate coin, re-proven live against the coordinator; and a wallet that has provably never
-   been through the ladder pass. Everything else refuses, and the coin is untouched by the refusal —
-   still withdrawable, still unilaterally exitable.
+   `mercuryrustlib::tesr::child_retransfer`; a coin with **no ladder is refused by name** —
+   `transfer_sender::execute_ex` has no backup chain to hand over (no coin carries one since
+   2026-09-06), the flat conveyance lane's licence classifier is deleted
+   (`assert_flat_conveyance_is_legitimate` no longer exists as a symbol; `PermanentLicence` survives
+   only in comments), and `is_legitimate_flat_reason` returns `false` unconditionally. The coin is untouched by
+   the refusal — still withdrawable — but it has no exit material until `claim()` ladders it.
 2. **Non-exact, laddered root** → `in_ladder_pay`. A STATE tier `SP` spends `X_m.out[0]` — a
    **descendant of the trigger**, never a rival for `F` — and pays the payee's PIECE plus the
    sender's CHANGE. The piece's child bundle is conveyed through the mailbox with the key-handover
@@ -245,10 +271,9 @@ plain off-chain split that was arm 5 is deleted, and the compiler — not a revi
 eight routes into it when `ParentShape::Unladdered` was removed first.
 
 **Handing a spine tip over whole is refused by name.** A tip's funding output is un-broadcast and
-there is no builder for a spine-tip conveyance, so `transfer` errors rather than falling through to
-the flat lane —
-which would hand the recipient a backup chain over an outpoint that will never exist on chain. The
-coin is untouched and still unilaterally exitable by this wallet.
+there is no builder for a spine-tip conveyance, so `transfer` errors rather than falling through to anything — there is no flat lane to fall
+through to (2026-09-06), and a conveyance over an outpoint that will never exist on chain would be
+a coin with no exit. The coin is untouched and still unilaterally exitable by this wallet.
 
 ### The in-ladder admission floor
 
@@ -257,30 +282,51 @@ coin is untouched and still unilaterally exitable by this wallet.
 **rate evaluations, not constants** — quoting one without its rate is quoting a rate. An app does
 not call it; it reads `quote_transfer` or the refusal text below.
 
-- A payee's **piece** is always a two-tier child (`establish_child` hangs an extension *and* a state
-  off `SP.out[j]`), so it must clear `mercurylib::tesr::min_child_value(rate, dust)` =
-  `2·(committed_fee(rate) + P2A) + dust` — **1 560 sat** at the shipped `committed_fee_rate` of
-  3.0 sat/vB.
+- **A payee's leg is admitted at ONE SATOSHI (REQ-83).** It is no longer always a two-tier child:
+  `mercurylib::tesr::LeafShape::for_value(value, rate, dust)` picks the shape from the value, and
+  `split_output_floors` admits at the cheapest band's floor,
+  `mercuryrustlib::tesr::SplitLegRole::Tail.min_value(rate, dust)` = **1**. At the shipped
+  `committed_fee_rate` of 3.0 sat/vB the bands are: ≥ `min_child_value` = **1 560** → `Piece`
+  (extension + state, two renewals); ≥ `min_spine_tip_value` = **945** → `ThinPiece` (one cap rung,
+  one renewal — `plan_child_renewal` says so by name); ≥ `DUST_LIMIT` = **330** → a `Ladderless`
+  stub, where `SP.out[j]` pays the payee's OWN key and IS their claim, with no child coin and no SE
+  slot; below dust → a `Tail`, coin-backed and carried at zero fee. The lower two bands do not exit
+  unaided (`LeafShape::exits_unaided()`), which is a stated trade, not a refusal.
 - The sender's **change** clears whatever shape that lane's builder actually gives it, reported by
   `mercuryrustlib::tesr::change_leg_role(lane)`. Three lanes — `PlainRoot`, `SpineBatch` and
   `Colored` — build a one-cap **spine tip**, so their change floor is
   `mercurylib::tesr::min_spine_tip_value` = `committed_fee(rate) + P2A + dust` = **945 sat** at the
   same rate. Only `PlainChild` builds a two-tier change, and it floors it at `min_child_value`.
-- The sub-coin backup floor `min_split_output(backup_rate)` = dust + the sub-coin's own 112-vB backup
-  fee applies to every leg as well, and the **larger binds**. It survived the un-laddered shape it
-  was first written for: the dust boundary is not un-laddered-only, and every leg still has to be
-  able to fund its own backup.
+- The floor `min_split_output(backup_rate)` = dust + a 112-vB spend's fee binds the **change** leg
+  (the larger of it and the role floor wins). It does **not** bind a payee's leg any more: a
+  ladderless or tail leg funds no transaction of its own, so maxing it against a floor for
+  transactions it never pays would refuse every stub for someone else's cost.
 
-One shared number could only reach the tip's floor by lowering the piece's floor with it, which
-admits a piece that cannot fund its second rung — discovered inside `establish_child`, *after* the
-parent has been terminalized, stranding it to unilateral-exit-only. So the SDK refuses up front, per
-leg, naming which leg fell short:
+- **Only the plain in-ladder ROOT lane carries the two lower bands.** `tesr::in_ladder_split` takes
+  stubs through a separate `ladderless` argument (`in_ladder_pay` sorts recipients into `children`
+  and `ladderless` *before* drawing derived-slot vouchers, so a stub burns none) and builds a `Tail`
+  as a coin-backed leg with an SE slot. `tesr::spine_batch_split` and the child lane refuse a `Stub`
+  or `Tail` leg **by name** — "this lane carries no ladderless legs — pay it from the plain root
+  lane" — and the coloured lane refuses a ladderless leg (`verify_ladderless_leaf`) and a coloured
+  tail (`refuse_coloured_tail`), the latter because a fragment authorising anyone to spend a *sealed*
+  outpoint is a burn switch. Nothing is co-signed by any of those refusals.
+
+Giving both legs one shared number could only reach the tip's floor by lowering the piece's floor
+with it, which used to admit a piece that could not fund its second rung — discovered inside
+`establish_child`, *after* the parent has been terminalized. The role now selects both the floor and
+the shape from the same `LeafShape` call, so admission and construction cannot come apart
+(`every_value_gets_a_role_that_can_afford_its_own_floor` sweeps it). The SDK still refuses up front,
+per leg, naming which leg fell short:
 
 ```
-in-ladder split refused — the piece falls short. The payee's piece (900) must be >= 1560 sat
-(it funds its own extension + state rungs) and the change (…) must be >= 945 sat (…); both must
-then clear the 330-sat dust floor. The split total is …
+in-ladder split refused — the change falls short. The payee's piece (…) must be >= 1 sat
+(…) and the change (…) must be >= 945 sat (…); both must then clear the 330-sat dust floor.
+The split total is …
 ```
+
+> The refusal's parenthetical still reads "it funds its own extension + state rungs" for the piece.
+> That text describes the `Piece` band only and is stale for the floor it now quotes — read the
+> NUMBER, not the gloss.
 
 ### Quoting
 
@@ -290,7 +336,7 @@ let q = wallet.quote_transfer(15_000).await?;
 // q.network_fee_sats + q.renewal_fee_sats == q.total_fee_sats  (one fee, shown like a payment fee)
 // q.fundable
 // q.stuck_coins             — worth less than their own re-anchor fee; combine to rescue
-// q.no_exit_material_coins  — no TES-R bundle AND no flat backup rows; combining does NOT rescue
+// q.no_exit_material_coins  — no TES-R bundle (no coin minted since 2026-09-06 has flat backup rows); combining does NOT rescue
 // q.note                    — a human-readable explanation of the verdict
 ```
 
@@ -436,8 +482,11 @@ wallet.convey_recovered_piece(&op_id, &piece_statechain_id, &recipient_address).
 
 Covered by `sdk81`. Structural RGB spends have their own healer,
 `wallet.recover_structural_spends()`; both coloured send entry points — `transfer_tokens` and
-`batch_transfer_tokens` — run it before selecting a carrier, so an app rarely calls it directly
-(`sdk73`).
+`batch_transfer_tokens` — run it before selecting a carrier, so an app rarely calls it directly.
+Under the rule its replay's registration step (`register_split_subcoins_n`) refuses, so an open
+legacy entry stays open and its carriers stay excluded from selection. Its E2E, `sdk73`, was
+**deleted** with the lane, and the live coloured in-ladder split has no structural-spend journal and
+no crash point — a stated KNOWN GAP, recoverable by hand, with no test of any kind against it.
 
 ## Receive (auto-claim + events)
 
@@ -456,9 +505,9 @@ while let Ok(ev) = events.recv().await {
         WalletEvent::LadderEstablished { statechain_id } => {}
         WalletEvent::LadderSkipped { statechain_id, reason } => {}      // transition-only
         WalletEvent::LadderDefended { statechain_id, tiers_broadcast } => {}
-        WalletEvent::ExitDeadlineApproaching { statechain_id, deadline_block, tip } => {}
-        WalletEvent::LeafExitForced { statechain_id, deadline_block, tip } => {}
-        WalletEvent::TokenCarrierMaterialized { statechain_id, deadline_block, tip } => {}
+        WalletEvent::ExitDeadlineApproaching { statechain_id, deadline_block, tip } => {} // legacy `branch-` coins only
+        WalletEvent::LeafExitForced { statechain_id, deadline_block, tip } => {}         // no longer emitted: its producer was deleted 2026-09-06
+        WalletEvent::TokenCarrierMaterialized { statechain_id, deadline_block, tip } => {} // legacy `branch-` carriers only
         WalletEvent::ExitBranchConflict { statechain_id } => {}         // someone raced your exit
         WalletEvent::CoinRefreshed { old_statechain_id, new_statechain_id, fee_sats } => {}
         WalletEvent::ColoredExitTipRegistered { statechain_id, outpoint } => {}
@@ -521,23 +570,30 @@ enclave.
 
 **Where it is on** — regtest today — a carrier is laddered like any other coin, coloured: every tier
 carries a valid RGB state transition, `transfer_tokens` takes the coloured in-ladder split, and
-`unilateral_exit` walks the coloured chain (`sdk74`, `sdk75`, `sdk77`). The legacy split lane is
-structurally closed on that configuration, with a narrow migration hatch for carriers that can never
-be coloured (`sdk78`).
+`unilateral_exit` walks the coloured chain (`sdk74` — run and passing per `dd03ab2`; `sdk75`,
+`sdk77` pending). The legacy split lane is closed on **every** configuration, and the narrow
+migration hatch it used to open for carriers that can never be coloured is **closed with it**:
+`refuse_legacy_colored_split_lane` refuses whether `colored_ladder` is on or off, because a child
+carved on that lane would have been exited by the flat backup chain, which no longer exists.
+`migration_hatch_verdict` survives only to word the refusal. Its E2E, `sdk78`, was deleted, so this
+class is **UNPROVEN** end to end.
 
-**Where it is off** — mainnet, until an enclave is provisioned — the carrier keeps the older shape:
+**Where it is off** — mainnet, until an enclave is provisioned — the carrier has **no ladder and no
+lane** (2026-09-06):
 
-- a carrier is never laddered: a plain tier spend carries no state transition and would destroy the
-  allocation, so `claim()` records `LadderSkipReason::RgbCarrier` and leaves it on the flat
-  signed-once backup shape (`sdk52`, `sdk39`). Note that this reason no longer *licenses* a flat
-  whole-coin conveyance — that licence was retired with the un-laddered shape — so read
-  `flat_only_coins`' third element rather than assuming the coin will hand over;
-- `transfer_tokens` / `batch_transfer_tokens` take the RGB-aware **flat** split lane
-  (`create_colored_split_tx` / `create_colored_combine_tx`), not the coloured in-ladder split. That
-  lane is still a live producer of `branch-` sub-coins, whose funding output is un-broadcast and
-  whose `branch-` rows are their only way down;
-- a carrier has **no unilateral exit**. `unilateral_exit` refuses it; the protection is
-  `materialise_carrier`, which settles the allocation on chain and is not an exit.
+- a carrier is never given a *plain* ladder: a plain tier spend carries no state transition and would
+  destroy the allocation, so `claim()` records `LadderSkipReason::RgbCarrier` (or
+  `AttestationIdentityUnpinned` on a public network) and leaves it with **no exit material** — there
+  is no flat signed-once backup underneath (`create_tx1` is deleted; `sdk52` re-derived, pending run).
+  The reason never licenses a whole-coin conveyance (`flat_only_coins`' third element is always
+  `false`);
+- `transfer_tokens` / `batch_transfer_tokens` cannot complete on it: the legacy RGB-aware split lane
+  (`create_colored_split_tx` / `create_colored_combine_tx`) is refused ahead of any co-sign by
+  `refuse_legacy_colored_split_lane` and again at `register_split_subcoins_n` /
+  `register_combine_subcoins` — there is no flat backup for a `branch-` sub-coin to be exited by.
+  `branch-` rows exist only on coins that predate the rule;
+- a carrier has **no unilateral exit** and no SE-free settlement: `unilateral_exit` refuses it by
+  name, and `materialise_carrier` only ever finds legacy `branch-` rows (TRUST-MODEL B12).
 
 The SDK enforces the carrier boundary everywhere: a carrier is excluded from plain-BTC coin
 selection, from Lightning swap selection, from the `withdraw` and `unilateral_exit` defaults (and
@@ -554,11 +610,14 @@ let txs    = wallet.query_token_transactions(&asset_id).await?;  // Vec<TokenTx>
 let l1     = wallet.get_token_l1_address().await?;               // == get_token_funding_address()
 
 wallet.transfer_tokens(&asset_id, &bob_address, 250).await?;
-// If no single carrier covers the amount, this combines several carriers of the asset into ONE
-// SE-co-signed coloured tx (piece + change); every combined carrier is made terminal first.
+// If no single carrier covers the amount there is NO combine transaction: each carrier's F is
+// already spent by its own trigger, so `colored_multi_carrier_transfer` runs one in-ladder split
+// PER CARRIER and conveys one child per leg. The legs are sequential and NOT atomic — a failure at
+// leg k leaves legs 0..k conveyed, and the error names every piece already handed over.
 
-// Multi-recipient: ONE SE-co-signed tx carves one piece per recipient plus this wallet's change;
-// each piece ships its own consignment. One TransferResult per recipient, in order.
+// Multi-recipient: ONE RECIPIENT ONLY today. The coloured engine refuses K > 1 by name
+// (`refuse_colored_multi_payee`, a shipped decision — pay coloured recipients one carrier each),
+// and the legacy N-piece lane that did serve K > 1 is retired.
 let results = wallet
     .batch_transfer_tokens(&asset_id, &[(bob_address.clone(), 250), (carol_address, 100)])
     .await?;
@@ -641,8 +700,8 @@ non-payment. Two shape-specific outcomes:
   is recovered (`sdk66`, `sdk68`).
 - **Exact laddered pay failure** leaves an orphan co-signed `S'`, so the coin is restored locally as
   exitable (value intact via `unilateral_exit`) but **off-chain re-transfer stays bricked until you
-  `refresh()`** it. A coin with no ladder has no orphan and reclaims off-chain via a self-transfer,
-  where the flat-conveyance classifier still licenses that coin.
+  `refresh()`** it. A coin with no ladder has no orphan — and no off-chain self-transfer either (2026-09-06: there is
+  no flat conveyance); it stays where it is until `claim()` ladders it.
 
 Adversarial coverage: `sdk19`, `sdk20`, `sdk24`, `sdk25`, `sdk37`.
 
@@ -676,19 +735,26 @@ chain. Each call advances as far as maturity allows and returns
   matures.
 - **Received child** — the same walk over `T → X_m → SP → ext_child → state_child`, keyless (every
   tier is already signed and the final state pays your own key).
-- **Coin with no ladder** — broadcast the locktime-free exit branch, then the latest backup once its
-  absolute `nLockTime` matures. This is the only way down for an off-chain sub-coin: its funding
-  output is un-broadcast, so there is nothing on chain to spend without the branch first.
+- **Spine tip** — the same walk down to the tip's single cap tier.
+- **Coin with no ladder** — **refused by name.** There is no flat exit fallback and no branch arm:
+  that arm is deleted, not guarded. The message says so ("a coin's only exit is its TES-R ladder, and
+  there is no flat backup to fall back to") and names the two things that can fix it — restore the
+  `tesr-*` rows from a recovery bundle, or run `claim()` so the establish pass ladders it. A legacy
+  `branch-` chain does not help here: `materialise_carrier` can settle an ALLOCATION with it, which
+  is not an exit.
 
-Guards: a coin that is not `CONFIRMED` is refused (exiting a parent already consumed by a split would
-invalidate the sub-coins it funded), and an RGB carrier is refused unless its ladder is **coloured**
-— an RGB-unaware sweep destroys the allocation. The un-colourable class gets its own refusal naming
-`materialise_carrier`, not a silently different outcome.
+Guards: a coin that is not **live** is refused — the predicate is `is_live_for_defence`
+(`IN_MEMPOOL | UNCONFIRMED | CONFIRMED`), not `CONFIRMED` alone, so a coin is exitable from the block
+its deposit is first seen in, while a parent already consumed by a split (`WITHDRAWN`) or handed away
+(`IN_TRANSFER`, `TRANSFERRED`) is refused, because exiting it would invalidate the sub-coins it
+funded. An RGB carrier is refused unless its ladder is **coloured** — an RGB-unaware sweep destroys
+the allocation. The un-colourable class gets its own refusal naming `materialise_carrier`, not a
+silently different outcome.
 
 ```rust
-// Sever from F on demand. Every prior owner of this coin retains rungs of its flat backup chain
-// over the SAME funding output; broadcasting the already-co-signed, un-timelocked T spends F and
-// kills all of them at once. It needs no counterparty — which is the point, because the party being
+// Sever from F on demand. Every prior owner of this coin retains a copy of the same un-timelocked
+// trigger T over the SAME funding output (no flat backup rungs exist since 2026-09-06); broadcasting
+// T yourself spends F and pre-empts every other spend of it at once. It needs no counterparty — which is the point, because the party being
 // defended against is the party a cooperative re-anchor would have to ask. It ENDS the exposure
 // rather than capping it, and it costs the coin's off-chain life. Mechanically unilateral_exit on
 // one coin, named for what it is for; see ../spec/TRUST-MODEL.md.
@@ -696,6 +762,7 @@ let statuses = wallet.sever_from_f(&statechain_id).await?;
 
 // Settle an un-colourable carrier's ALLOCATION on chain. NOT an exit: the sats stay on the live
 // 2-of-2. Returns true if a branch was broadcast, false if the carrier verifiably had none.
+// Legacy only: `branch-` rows exist on carriers from before 2026-09-06; one minted since has none.
 let acted = wallet.materialise_carrier(&statechain_id).await?;
 
 // Answer a griefer's confirmed trigger: spend at zero CSV wait, killing every retained tier.
@@ -709,11 +776,10 @@ let est = wallet.estimate_exit_cost(&statechain_id).await?;
 // est.branch_txs, est.branch_vbytes, est.backup_vbytes, est.total_vbytes
 // est.fee_sats_at(rate)
 // est.wait_blocks          — when the exit COMPLETES
-// est.exit_deadline_block  — the SAFETY deadline for an off-chain sub-coin: the earliest height an
-//                            ancestor could broadcast a stale backup. `None` when the coin carries
-//                            no exit branch at all — a coin funded on chain, a laddered root
-//                            included — which is NOT a claim that it has no calendar (the retained
-//                            flat chain does).
+// est.exit_deadline_block  — `None` for every laddered coin, and since 2026-09-06 that None IS the
+//                            claim that the coin has no calendar: no ancestor holds a matured spend
+//                            of F. Only a legacy `branch-` sub-coin from before the rule reports a
+//                            deposit-anchored height here.
 // est.exit_deadline_blind  — Some(reason) means "I could not tell", never "nothing is due"
 ```
 
@@ -750,9 +816,9 @@ let refreshed = wallet.auto_refresh_due(cfg.auto_refresh_margin_blocks).await?; 
 //    land at your own key. Emits LadderDefended.
 let acted = wallet.defend_ladders().await?;
 
-// 3. DEADLINE TOWER — force-exit plain off-chain sub-coins and MATERIALIZE received RGB carriers
-//    within margin of their exit-race deadline. Emits ExitDeadlineApproaching / LeafExitForced /
-//    TokenCarrierMaterialized.
+// 3. HEIGHT-KEYED PASS — legacy subject only (2026-09-06): materializes a received RGB carrier that
+//    still carries pre-rule `branch-` rows near its deposit-anchored deadline. No laddered coin, leaf
+//    or tip is its subject; the leaf loop is deleted and LeafExitForced is no longer emitted.
 let acted = wallet.auto_exit_due(cfg.auto_exit_margin_blocks).await?;
 ```
 
@@ -763,12 +829,12 @@ retains a `WatchtowerFault`, and returns `Err`. `defend_ladders` additionally re
 from blindness so a later success on some other coin cannot erase it — no pass recovers that coin
 (`sdk72`).
 
-Note the interaction with `colored_ladder`: `deadline_safety_due`'s unilateral fallback runs through
-`unilateral_exit`, which refuses a carrier without a coloured ladder. Where the flag is on that is no
-carrier at all — the coloured ladder is the remedy, and `sdk87` is the flow for it. Where it is off,
-for want of an enclave to pin, it is every carrier, and those coins are reported three ways (event,
-stdout line, `Err`) rather than folded into a clean pass: the flat carrier lane has no remedy here,
-and the SDK just stops claiming one.
+Note the interaction with `colored_ladder`: `deadline_safety_due` has no laddered subject (its
+due-predicate reads `coin.locktime`, `None` for life), so its unilateral fallback through
+`unilateral_exit` — which refuses a carrier without a coloured ladder — is never reached for a coin
+minted under the rule. Where the flag is off, for want of an enclave to pin, every carrier has no
+exit material at all (TRUST-MODEL B12), and the SDK says so rather than claiming a remedy. `sdk87`,
+which drove a carrier deadline through this pass, is re-derived — pending run.
 
 ### Delegated watching, without custody
 
@@ -789,8 +855,9 @@ match watch_pass(&bundle, &electrum_client, margin_blocks) {
 
 Run it on a cron anywhere, from any number of machines — no wallet database, no SE, no keys.
 Broadcasts are idempotent and every tower broadcasts the SAME transactions, so a second tower can
-never conflict with the first. Carriers are exported **without** their backup transaction, so a tower
-structurally cannot do the token-destroying sweep (`sdk45`, `sdk51`, `sdk34`, `sdk79`, `sdk80`).
+never conflict with the first. Every entry is exported **without** a backup transaction — none exists (2026-09-06) — and is
+event-driven (`deadline_block: u32::MAX`, a trigger on `F`), so a tower structurally cannot do a
+token-destroying sweep (`sdk45`, `sdk51`, `sdk79`, `sdk80`; `sdk34` re-derived, pending run).
 `export_watch_bundle` fails closed for a token wallet whose carriers cannot be enumerated, and
 refuses to export an entry whose deadline is blind.
 
@@ -809,15 +876,14 @@ the current outpoint is spent into a fresh deposit aggregate (new `statechain_id
 owner's pre-signed material against it is permanently dead.
 
 It does **not** reset the exit — a laddered coin's exit is the CSV tier chain, which never matures
-while idle. It **does** reset the coin's flat calendar, by minting a fresh chain at
-`tip + initlock`, which is what makes it the answer for a coin that has spent most of its hop budget.
-Reach for it to:
+while idle — and it resets no calendar, because there is none (2026-09-06): the new coin is laddered
+at first sight of its funding transaction and carries no flat chain. It resets **depth and the hop
+budget**, which is what makes it the answer for a coin at its renewal/rollover cap. Reach for it to:
 
-- reset a coin approaching its flat-chain deadline (this is what `deadline_safety_due` does for you);
+- re-anchor a coin that has spent its hop budget or sits at the depth cap (nothing schedules this
+  for you: `deadline_safety_due` has no laddered subject);
 - **un-brick** a coin whose exact-lane Lightning pay failed (its orphan `S'` blocks off-chain
   re-transfer until re-anchored);
-- reset a coin with no ladder whose decrementing-`nLockTime` backup chain is nearing its floor (a
-  receiver rejects a backup at or below the tip — `MercuryError::LocktimeTooLow`);
 - consolidate an off-chain coin back onto a confirmed outpoint.
 
 Refresh is **cooperative** (it needs the SE); if the SE is gone, exit unilaterally instead. The coin
@@ -832,9 +898,11 @@ let r = wallet.refresh(&statechain_id, None).await?;
 // r.new_amount_sats == old − fee, r.fee_sats, r.refresh_txid, r.rebate_sats
 
 // Operator pays: the same on-chain re-anchor, then a funded `sponsor` wallet reimburses the fee
-// OFF-CHAIN so the user's total ends >= whole. r.rebate_sats is max(fee + dust, min_child_value) —
-// the rebate must itself be an off-chain-payable piece, which on a laddered sponsor means clearing
-// the 1 560-sat in-ladder piece floor at the shipped 3.0 sat/vB rate.
+// OFF-CHAIN so the user's total ends >= whole. r.rebate_sats is max(fee + dust, min_child_value)
+// = max(fee + 330, 1 560) at the shipped 3.0 sat/vB rate. Note `min_child_value` here is the code's
+// own literal choice, not the admission floor: since REQ-83 a payee's leg is admitted at 1 sat, so
+// the rebate is deliberately sized to a FULLY LADDERED two-rung child rather than to the cheapest
+// leg the split would accept. The operator absorbs the difference.
 let r = wallet.refresh_sponsored(&statechain_id, &sponsor, None).await?;
 
 // The sponsor's own half, if you are building the operator side:
@@ -871,12 +939,11 @@ Untyped refusals worth recognising:
 - the per-leg in-ladder floor message (*"the piece falls short"* / *"the change falls short"*) — the
   leg named was too small to fund the rungs its lane's builder gives it;
 - *"coin … is a SPINE TIP"* — a whole-coin handover of a change tip, which has no conveyance builder;
-- `LocktimeTooLow` on a flat backup-chain handover — that coin needs a `refresh` first;
 - *"has no ladder of any kind … the un-laddered lane it would once have taken is RETIRED"* — the coin
   carries no `tesr-`/`ctesr-`/`spinetip-` record at all. Run `claim()` and read `ladder_skip_reason`
   if it declines; the coin is unaffected and still withdrawable;
-- *"no exit material on any lane"* — the slot has neither a TES-R bundle nor flat backup rows;
-  combining does not rescue it.
+- *"no exit material on any lane"* — the slot has no TES-R bundle (and no coin minted since
+  2026-09-06 has flat backup rows); combining does not rescue it.
 
 `CancelRefused` and `CancelNeedsRecipientConsent` are re-exported from the crate root so a
 cancellation refusal can be branched on rather than string-matched.
@@ -895,7 +962,10 @@ either:
 
 ## Testing
 
-Live end-to-end cases run from `clients/tests/rust` under `SDK_E2E=<n>`; the numbers reach 91 and are
-not contiguous. `SDK_E2E=22` is `chaos22`, the concurrent fuzzer (N users acting in parallel against
-a spec-invariant oracle). See [`testing-guide.md`](testing-guide.md) for the run environment and
-per-suite invocation.
+Live end-to-end cases run from `clients/tests/rust` under `SDK_E2E=<n>`; the numbers reach **94** and
+are not contiguous — and two gaps are new, `73` and `78` having been DELETED with the retired lane
+(so are `RGB_E2E=1, 2, 3, 5, 6, 8, 9, 10`). `SDK_E2E=22` is `chaos22`, the concurrent fuzzer (N users
+acting in parallel against a spec-invariant oracle). Only a sixteen-flow subset has been run since
+the rule landed (`dd03ab2`: `SDK_E2E` 15, 37, 40, 42, 44, 45, 48, 49, 50, 58, 59, 60, 71, 74, 76,
+85); cite anything else as pending. See [`testing-guide.md`](testing-guide.md) for the run
+environment and per-suite invocation.

@@ -3,20 +3,32 @@
 **Mercury Utexo is a Bitcoin L2 with Spark-class UX on a single statechain entity.** Users deposit
 BTC (or RGB assets) onto statechain coins and then transact **off-chain, instantly, with no
 per-payment on-chain cost**: payments of any amount, token transfers, and Lightning in both
-directions. Every coin stays unilaterally exitable to Bitcoin L1, without anyone's permission.
+directions. A coin that carries its TES-R ladder stays unilaterally exitable to Bitcoin L1, without
+anyone's permission — and since 2026-09-06 that ladder is a coin's *only* exit material, so a coin
+that could not be laddered has no unilateral exit at all and depends on the SE for a cooperative
+withdrawal. When that happens, and why it is not an edge case on an un-provisioned network, is
+[below](#what-is-not-built).
 
 Normative detail lives in [`../spec/`](../spec/README.md). This page is the whole system on one
 screen.
 
+*A note on the `sdkNN` / `rgbNN` citations below.* They name E2E flows against the regtest stack. The
+unit suites are green (mercuryrustlib 387, mercury-utexo-sdk 152, ci-guards 32 suites) and the E2E
+crate compiles, but **no E2E flow has been run since the flat backup chain was removed on
+2026-09-06**; the flows were re-derived, not re-measured. Read every one of them as pending run.
+
 ## The one thing to understand: an idle ladder never ages
 
-`claim()` establishes a **TES-R** ladder (*Trigger / Extension / State*) over every fresh confirmed
-**root** coin, unconditionally — no setting selects it, and a laddered coin cannot be conveyed as a
-flat one (`sdk71`):
+`claim()` establishes a **TES-R** ladder (*Trigger / Extension / State*) over every fresh **root**
+coin from the first mempool sighting of its funding transaction — no setting selects it, and *no*
+coin, laddered or not, can be conveyed on a flat lane (`sdk71`, pending run). What can stop it is a
+recorded `LadderSkipReason`, and one of those is not an edge case: on a network with no pinned
+enclave attestation identity the SDK's establish pass ladders **nothing** — see
+[what is not built](#what-is-not-built).
 
 ```
 F   on-chain funding output, 2-of-2 (you + SE)
-└─ T    TRIGGER     no timelock — signed once at deposit
+└─ T    TRIGGER     no timelock — signed once at first sight of F
    └─ X_m  EXTENSION  RELATIVE CSV E_m — renewal replaces it horizontally, off-chain
       └─ S_k  STATE     RELATIVE CSV Δ_k — decrements by δ on every transfer
 ```
@@ -25,20 +37,35 @@ All three tiers are v3/TRUC with a 240-sat P2A anchor, pre-signed and **un-broad
 timelocks are **relative** (BIP-68/112): they only begin counting once the parent confirms — and `T`
 has no timelock at all, so **nothing matures until someone broadcasts `T`**. Consequences:
 
-- **No CSV-side clock.** A ladder sitting still is not ageing toward anything.
+- **No clock.** A ladder sitting still is not ageing toward anything — and there is nothing else on
+  the coin that could.
+- **Nobody can take your coin on a date.** This is the plain-language point of the 2026-09-06 rule and
+  the reason it was made. A prior owner of your coin holds **no transaction that ripens**: the flat
+  backup chain — a retained chain of *absolute* locktimes, whose lowest height was the moment an
+  earlier owner's transaction became broadcastable — is deleted. What a past owner still holds is the
+  shared, un-timelocked trigger and superseded states: pre-emptable, loud the moment they are
+  broadcast, and beaten per tier by your own lower CSV. So there is no date to diary, no deadline a
+  wallet must survive to keep your money, and nothing you must do before some height to stay safe.
+  Being offline for a year costs you nothing. The obligation that remains is purely **reactive** — if
+  someone broadcasts the trigger, answer within the CSV windows — and you can hand that to any keyless
+  machine.
 - **0 vB of idle rent.** On-chain footprint scales with *activity*, not with time.
 - **Off-chain forever.** Renewal (re-signing a lower-CSV extension) and rollover (a fresh level) are
   off-chain and unbounded — a coin can live off-chain indefinitely (`sdk43`).
 
-**The honest half of that sentence.** The ladder is not the coin's only pre-signed material. A
-**flat backup chain** over `F` is retained alongside it, carrying absolute locktimes
-`L_k = L_0 − k·interval`, one decrement per whole-coin hop. So a coin that has been *received* sits
-on `min(L_k)` — a real calendar height held by its prior owners — inside a root epoch of
-`initlock` = **10,000 blocks ≈ 69.4 days** on mainnet (`TesrParams::flat_ladder_params_const`,
-`lib/src/tesr.rs`). `SDK_E2E=86` measures exactly this. Laddering deletes the CSV-side ageing and
-nothing else; `deadline_safety_due` (`clients/libs/rust-sdk/src/refresh.rs`) is what defends the
-remaining height, and `refresh` — one ~112-vB on-chain **re-anchor** to a fresh funding outpoint with
-a fresh ladder (`sdk30`) — is how you buy a new epoch.
+**And that is the whole sentence (since 2026-09-06).** The ladder is the coin's ONLY pre-signed
+material. No coin carries an absolute-locktime backup transaction — none at deposit (`create_tx1` is
+deleted; the ladder is co-signed at the first mempool sighting of the funding transaction) and none
+at any hop — so there is no flat backup chain, no `L_k`, no `min(L_k)` held by prior owners and no
+root epoch. `coin.locktime` is `None` for life; INV-5 (the decrementing backup chain) is RETIRED and
+INV-27 ("idle coins never age") is unconditional. `initlock` / `interval` survive in `/info/config`
+and `TesrParams::flat_ladder_params` (`lib/src/tesr.rs`) only as compatibility constants — `initlock`
+is the fixed exit window the split-depth cap measures a leaf's walk against, `interval` is applied to
+nothing. `deadline_safety_due` (`clients/libs/rust-sdk/src/refresh.rs`) has no laddered subject, and
+`refresh` — one ~112-vB on-chain **re-anchor** to a fresh funding outpoint with a fresh ladder
+(`sdk30`) — resets depth and the hop budget, never a calendar. *(The paragraph that stood here
+described a retained flat chain and `SDK_E2E=86` measuring it; sdk86 is re-derived to assert the
+opposite — no calendar on a received coin — pending run.)*
 
 ## A payment is a split, and the piece is a real coin
 
@@ -54,9 +81,16 @@ coincidence, so essentially every payment is an **in-ladder split**: a state tie
   (`spine_batch_split`) over that tip, so payment 1 and payment 1000 are the same object and each
   payment adds exactly **one** transaction to the sender's exit chain.
 
-Floors are rate evaluations, not constants: at the shipped committed rate of **3 sat/vB**
-(`TesrParams::committed_fee_rate`) a piece must clear `min_child_value` = **1,560 sat** and a tip
-`min_spine_tip_value` = **945 sat** (`lib/src/tesr.rs`). Both are checked *before* the parent is
+Floors are rate evaluations, not constants, and the two legs are floored apart. The **tip** must
+clear `min_spine_tip_value` = **945 sat** at the shipped committed rate of **3 sat/vB**
+(`TesrParams::committed_fee_rate`, `lib/src/tesr.rs`). A **piece** is admitted at **1 satoshi**
+(`split_output_floors` reads `SplitLegRole::Tail.min_value`): what the payee's leg is *built* as
+follows from its value alone (`LeafShape::for_value`) — ≥ 1,560 sat (`min_child_value`) buys the
+two-rung piece, 945–1,559 one rung, 330–944 a *stub* that pays the payee's own key and holds no rung
+at all, below 330 a *tail*. Only the two-rung and one-rung shapes exit unaided
+(`LeafShape::exits_unaided`); the smaller bands leave on their group's exit, which is the accepted
+trade, not a defect. (The single-recipient `in_ladder_pay` lane passes no stub leg, so a stub-band
+amount is refused there by name, before any co-sign.) Every floor is checked *before* the parent is
 terminalized, so a piece too small to establish never strands its parent. `sdk58` (12 tamperings,
 each rejected for the named reason it targets), `sdk59` (the end-to-end split payment).
 
@@ -83,8 +117,10 @@ See [`../spec/CHILDREN.md`](../spec/CHILDREN.md).
   receive `sdk67`, failure + rollback `sdk68`/`sdk66`, remote SSP over HTTP `sdk21`. A latched piece
   is the one case that stays terminalized. See [lightning](lightning.md) and
   [`../spec/LIGHTNING.md`](../spec/LIGHTNING.md).
-- **Self-custody.** 2-of-2 (you + SE) with a pre-signed exit chain. The SE can never move funds alone
-  and can never freeze you out.
+- **Self-custody.** 2-of-2 (you + SE) with a pre-signed exit chain. The SE can never move funds alone,
+  and can never freeze out a coin that holds its ladder. (A coin with no ladder is the exception, and
+  it is the one case where the SE's cooperation is the only way out — see
+  [unilateral exit](#unilateral-exit).)
 
 ## One shape — and a carrier is no longer the exception
 
@@ -108,9 +144,10 @@ is the whole point of reading the pin. [`../spec/SPEC.md`](../spec/SPEC.md) §0.
 **What colouring a tier cannot do is broadcast a funding output**, and that fact is permanent. Every
 in-ladder split **child** and every **spine tip** is funded by an output of the un-broadcast `SP`, so
 it can never root a trigger of its own: its exit material is the chain reaching back to its parent's
-confirmed root, and for a coloured one the stored `branch-` rows are the RGB witnesses that settle it
-on chain (`sdk39` settles one two splits deep, broadcasting its branch root-first; `sdk34`
-materializes a carrier before its deadline, `sdk32` documents the residual window). That is not a
+confirmed root, and for a coloured one the tiers themselves carry the RGB witnesses that settle the allocation
+(`sdk75` walks a coloured ladder to confirmation with the allocation intact). *(`branch-` rows exist
+only on coins that predate 2026-09-06; `sdk39`, `sdk34` and `sdk32` drove that retired branch lane
+and its deadline-driven materialisation, and are re-derived, pending run.)* That is not a
 lesser kind of coin — it is where the 0 vB of idle rent comes from.
 
 What *is* gone is the plain **un-laddered lane**: `ParentShape::Unladdered`, `split_coin` and the
@@ -126,12 +163,15 @@ no longer a route that spends `F`.
   out each relative timelock in turn. Not a single broadcast — `unilateral_exit` (`sdk50`), and
   `sdk45` drives the same walk from a bundle holding **no key material**. A **coloured** carrier walks
   the same way, and the walk moves the allocation to your own key (`sdk75`).
-- **A coin carrying only flat material** — a legacy pre-ladder coin, or one whose `claim()` never
-  completed: broadcast the pre-signed branch and then its backup once the absolute locktime passes.
-  Your locktime is the earliest of all owners', so you win the race. `unilateral_exit` keeps this as
-  its last arm and **refuses outright if the coin is a carrier**, because an RGB-unaware spend would
-  destroy the allocation; a carrier with no coloured ladder settles through `materialise_carrier`
-  instead.
+- **A coin with no ladder** — one whose ladder could not be established (a recorded
+  `LadderSkipReason`) has **no exit material** (2026-09-06). There is no flat backup to fall back to
+  and no flat arm left in `unilateral_exit`: it refuses by name ("no `tesr-` ladder row and therefore
+  no exit material"), and `broadcast_backup_tx` on a laddered coin refuses too. It also cannot be
+  conveyed (`transfer_sender::execute` refuses it by name). **Its only route out is the cooperative
+  withdrawal**, which no longer reads backup rows at all (`withdraw::execute`) and therefore still
+  works — so such a coin depends on the SE being reachable. Run `claim()` again; the transient
+  reasons clear on a later pass. A carrier still holding legacy `branch-` rows from before the rule
+  can settle its allocation through `materialise_carrier`, which is a settlement and not an exit.
 - **Cooperative exit (normal):** `withdraw` — the SE co-signs a direct spend to your L1 address, one
   transaction, no wait. A received in-ladder child has no confirmed outpoint to spend, so it routes
   to the walk instead.
@@ -157,7 +197,7 @@ everyone ([`../spec/PARTIAL-PAYMENT-ECONOMICS.md`](../spec/PARTIAL-PAYMENT-ECONO
 | walked out unilaterally | 250 – 2,719 vB | worse than on-chain |
 
 The walked range is `293·d + 375` vB over `3 + 2d` transactions; its top is the mainnet cap of depth
-**8** / **19 transactions**, which is *derived* from the schedule and the epoch (`max_split_depth`,
+**8** / **19 transactions**, which is *derived* from the schedule and the fixed `initlock` exit window (`max_split_depth`,
 `max_exit_txs`, `lib/src/transfer/receiver.rs`), not a chosen literal. The swept row is the row that
 turns the lane positive for the median user, and it is the one no product surface reaches:
 `combine_leaves` (`clients/libs/rust/src/combine.rs`) is driven end to end against a live SE and a
@@ -179,11 +219,24 @@ Stated here rather than left for a reader to discover:
   by two independent *local* gates first — which a cheating payer does not run. The owner latch that
   would replace the clock is specified and not built.
 - **A mainnet enclave attestation identity.** The census is only as good as the key that signs it.
-  `TesrParams::attestation_identity_const` pins **regtest's**, and returns `None` for mainnet, testnet
-  and signet, where no enclave is provisioned — so on those networks the identity must be configured
-  (`SdkConfig::attestation_identity`), and with none the client **refuses** rather than falling back to
-  the key the coordinator serves. This is also what holds `colored_ladder` off there: a carrier's
-  ladder is only worth having if its terminality can be verified.
+  `TesrParams::attestation_identity_const` pins **regtest's**, and returns `None` for mainnet and for
+  every public testnet (`testnet`, `testnet3`, `testnet4`, `signet`), where no enclave is provisioned
+  — so on those networks the identity must be configured (`SdkConfig::attestation_identity`), and
+  with none the client **refuses** rather than falling back to the key the coordinator serves. This
+  is also what holds `colored_ladder` off there: a carrier's ladder is only worth having if its
+  terminality can be verified.
+
+  **State the consequence plainly, because it changed on 2026-09-06.** The SDK `claim()` establish
+  pass calls `get_statechain_info` for *every* root coin (it needs the coordinator's aggregate to
+  bind the ladder against), and on an unpinned, unconfigured network that call fails: the pass
+  records `LadderSkipReason::AttestationIdentityUnpinned` and ladders **nothing** — plain coins
+  included. Such a deposit *is* booked, but it has no exit material: it can be neither conveyed nor
+  unilaterally exited, and cooperative withdrawal is the only way out. The flat backup used to
+  provide that unilateral exit without any attestation, and it no longer exists. (The
+  mercuryrustlib `update_coins` lane — `LadderAtSight::Plain` — does *not* call
+  `get_statechain_info` and so ladders without a pin; the SDK lane, which is the one a wallet user
+  takes, does.) Since no mainnet enclave is provisioned at all, this is a **not-yet-deployable
+  state**, not a live regression.
 
 ## The developer surface
 

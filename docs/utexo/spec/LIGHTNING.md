@@ -37,12 +37,29 @@ route was not.
 **Coin shapes.** Both sats lanes run on **laddered** coins. Under CTES-R the colored (RGB) lane rides
 a laddered carrier too — a COLOURED ladder, every tier carrying a valid RGB state transition, so a
 tier spend moves the allocation instead of destroying it (terminal freeze,
-[PROTOCOL.md](PROTOCOL.md) §5.10; `sdk52` pins that a carrier is never given a *plain* ladder, `sdk74`
-/ `sdk75` the coloured one). Whether that applies is a property of the NETWORK:
+[PROTOCOL.md](PROTOCOL.md) §5.10; `sdk52` was RE-DERIVED and now pins that the carrier carries a
+COLOURED ladder — its old "the carrier carries none" assertion is gone from the flow, not merely
+superseded — with `sdk74` / `sdk75` on the coloured shape). Whether that applies is a property of the NETWORK:
 `SdkConfig::colored_ladder` reads the compiled-in enclave attestation pin, so it is on for regtest and
-off for mainnet/testnet/signet until an enclave is provisioned there (`SPEC.md` §0.4 V-6). Where it is
-off, a carrier keeps the flat signed-once shape and this document's flat-lane statements are the ones
-that apply. See [PROTOCOL.md](PROTOCOL.md), "One protocol, ONE coin SHAPE".
+off for mainnet/testnet3/testnet4/signet until an enclave is provisioned there (`SPEC.md` §0.4 V-6).
+**Where it is off there is no other shape to fall back to.** The flat signed-once backup this document
+used to name as that fallback was DELETED on 2026-09-06 (`deposit::create_tx1` is gone), and on an
+unpinned network the SDK `claim()` establish pass ladders NOTHING — carrier or plain — because it
+binds through the attested `get_statechain_info`, which refuses when `attestation_identity` can
+resolve neither a pin nor a configured value; the pass records
+`LadderSkipReason::AttestationIdentityUnpinned`. Such a deposit is BOOKED and has **no exit material
+at all**: it cannot be conveyed, it cannot be unilaterally exited, and **cooperative withdrawal is the
+only route out** — so no LN lane can latch it either. This is a not-yet-deployable state rather than a
+live regression: no enclave is provisioned on any of those networks. See [PROTOCOL.md](PROTOCOL.md),
+"One protocol, ONE coin SHAPE".
+
+> **Every `sdkNN` / `tbNN` citation in this document is PENDING RUN.** The rule that removed the flat
+> backup chain landed with the E2E suite re-derived but not re-run against the regtest stack. Of the
+> flows cited below, `sdk53`, `sdk63`, `sdk64` and `sdk68` were rewritten by that commit; `sdk65`,
+> `sdk66`, `sdk67`, `sdk24` and `sdk25` were not touched, but they drive the deposit path whose shape
+> changed underneath them (three co-signs, no `tx1`), so a green run predating the rule proves less
+> than it did. What HAS been measured is the offline suite: `mercuryrustlib` 387, `mercury-utexo-sdk`
+> 152, `ci-guards` 32 suites, no failures.
 
 > **The colored PAY lane has a real hole, and the deletions above narrowed rather than caused it.**
 > An RGB Lightning pay reaches the latch through `latch_tokens` → `colored_transfer`
@@ -136,8 +153,10 @@ The user pays an external merchant BOLT11 (hash `H`) with a coin.
    `server/src/endpoints/lightning_latch.rs`); the SE stores `H` and never learns the preimage.
 2. User conveys the coin to the SSP (`S'` pays the SSP), latched under `batch_id`, `locked2` pending.
 3. **SSP pre-pay census — the load-bearing check.** Before `send_payment`, the SSP decrypts the
-   bundle (`peek_pending_transfers`) and runs the full `verify_bundle` /
-   `num_sigs == disclosed-ladder` census, reading the **enclave-authoritative** `sig_count`
+   bundle (`peek_pending_transfers`) and runs the full `verify_bundle` census — the two-category
+   exact equality `se_num_sigs == tiers + superseded`, the flat term ZERO by construction
+   (`PARENT_V2_BASELINE = CHILD_V2_BASELINE = 0`, and a non-empty conveyed `backup_transactions`
+   vector is refused by name before the count) — reading the **enclave-authoritative** `sig_count`
    (`GET /signature_count`), *not* the coordinator DB. A hidden lower-CSV `S*` inflates `sig_count`
    beyond the disclosed ladder → mismatch → **refuse to pay**, before the irreversible LN leg. The
    pending-transfer lock (`has_open_transfer`, `server/src/database/transfer_sender.rs`) blocks any
@@ -199,12 +218,20 @@ Adversarial regression: `sdk65` case A.
 
 ### Admission floor
 
-A child funds its **own** two tiers plus dust, so the piece must clear
+A **two-rung** child funds its own two tiers plus dust, so it must clear
 `min_child_value = 2·(committed_fee(rate) + 240) + 330` — **1 560 sat** at the shipped
-`committed_fee_rate = 3.0` — and not the 442-sat backup-fee floor that bounds a plain transfer. The
-floor is a function of the rate: quoting one of these numbers without its rate is quoting a rate
-([SPEC.md](SPEC.md), [CHILDREN.md](CHILDREN.md)). Admitting below `min_child_value` terminalizes the
-parent and *then* fails, stranding it. Sizing goes through `tier_out_total` /
+`committed_fee_rate = 3.0` — and not the 442-sat backup-fee floor that used to bound a plain transfer.
+The floor is a function of the rate: quoting one of these numbers without its rate is quoting a rate
+([SPEC.md](SPEC.md), [CHILDREN.md](CHILDREN.md)).
+
+**1 560 is the floor of that band, not the admission floor.** Since REQ-83 `split_output_floors` admits
+a payee's leg at `SplitLegRole::Tail.min_value(..)` — **one satoshi** — and `LeafShape::for_value`
+then selects what is BUILT: `Laddered` (two rungs) at ≥ 1 560, `SpineTip` (one rung) at ≥ 945
+(`min_spine_tip_value`), `Stub` at ≥ dust, `Tail` below it. `LeafShape::exits_unaided` is **false** for
+every band under one rung: a stub or tail is a real payment that cannot be put on chain by its owner
+alone. An LN piece should therefore be sized at or above `min_child_value` deliberately, not because
+admission would stop it. Admitting a leg the builder cannot construct terminalizes the parent and
+*then* fails, stranding it — which is why the bands and the floors must be read as one decision. Sizing goes through `tier_out_total` /
 `committed_fee_for_outputs` / `min_child_value` (`clients/libs/rust-sdk/src/transfer.rs`,
 `mercurylib::tesr`).
 
@@ -232,8 +259,7 @@ un-broadcast.
 
 ## 7. Failure and rollback
 
-On a coin carrying **no ladder** — the flat carrier residual — `reclaim_lightning_payment` (a
-self-transfer) returns a fully re-usable coin. On a **laddered** coin the naive self-transfer **bricks**: the failed latch already co-signed
+On a **laddered** coin the naive self-transfer **bricks**: the failed latch already co-signed
 the orphan `S'` (`sig_count` +1), so the reclaim's own presign leaves the disclosed ladder one tier
 short of the enclave `sig_count` and `verify_bundle` rejects. Handled by direction:
 
@@ -259,10 +285,15 @@ coordinator-authoritative count decrement must be tightly scoped so it can never
 enclave terminalization (§10) does **not** help here — terminalizing the latched coin makes rollback
 worse, since the coin's only permitted spend becomes the SSP-paying `S'`.
 
-**Coverage note:** the flat self-transfer branch of `reclaim_lightning_payment` has **no live
-E2E**. Since every plain deposit is laddered, the branch exists only for the flat carrier residual —
-narrower since the CTES-R flip, and now reachable only on a network with no pinned enclave identity or
-on a carrier the coloured builder cannot take. The laddered branch is `sdk68`; the non-exact rollback is `sdk66`.
+**Coverage note — and the un-laddered branch is now DEAD, not merely untested.**
+`reclaim_lightning_payment`'s other branch self-transfers a coin with no ladder, and its code comment
+still says such coins "reclaim cleanly off-chain via the self-transfer below". They do not: a
+self-transfer IS a conveyance, and since 2026-09-06 `transfer_sender::execute_ex` refuses a coin with
+no `tesr-` row **by name** ("a coin with no ladder row cannot be conveyed at all"). So on the two
+populations that branch was left for — a carrier the coloured builder cannot take, and every SDK
+deposit on a network with no pinned enclave identity — the reclaim cannot succeed by that route, and
+cooperative `withdraw` is what recovers the value. The laddered branch is `sdk68` (re-derived, pending
+run); the non-exact rollback is `sdk66` (untouched, not re-run).
 
 ## 8. Trust assumption
 

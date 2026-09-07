@@ -21,13 +21,16 @@ leaves them `None` for you to set.
 > coloured, via `build_colored_ladder_auto` — and **mainnet is off**, not as a judgement about the
 > lane but because no mainnet enclave is provisioned yet. Pin one and it flips itself.
 >
-> Where it is off, the carrier keeps the **flat signed-once backup** and moves by colored split plus
-> backup-chain handover. That is why the whole of
-> [Over time](#over-time-what-you-and-your-holders-actually-watch) has so much to say about absolute
-> locktimes: a flat carrier has no CSV tier chain, so its exit is not calendar-free the way a laddered
-> coin's is. `sdk02`, `sdk29`, `sdk31`, `sdk32`, `sdk34`, `sdk74`, `sdk75`, `sdk77` and `sdk78` set
-> the flag by name; `sdk09`, `sdk36`, `sdk39`, `sdk52` and `sdk73` inherit whatever the constructor
-> derives.
+> Where it is off, the carrier has **no ladder and nothing underneath it** (2026-09-06): no flat
+> signed-once backup exists for any coin (`create_tx1` is deleted), the legacy colored split plus
+> backup-chain handover cannot complete (`refuse_legacy_colored_split_lane` refuses ahead of it on
+> BOTH settings of the flag, and `register_split_subcoins_n` / `register_combine_subcoins` refuse by
+> name behind it), and there is no calendar on any coin. Such a carrier is **holding only**, with no
+> exit material, until an identity is pinned and a later `claim()` pass colours it (TRUST-MODEL
+> B12) — see [Over time](#over-time-what-you-and-your-holders-actually-watch). `sdk02`, `sdk29`,
+> `sdk31`, `sdk32`, `sdk34`, `sdk74`, `sdk75` and `sdk77` set the flag by name; `sdk09`, `sdk36`,
+> `sdk39` and `sdk52` inherit whatever the constructor derives. (`sdk73` and `sdk78`, which used to
+> appear in these lists, were DELETED with the retired lane.)
 
 ## Launch a token (NIA — fixed supply)
 
@@ -62,16 +65,19 @@ the colored deposit that binds the supply to the carrier. After that confirms �
 `TOKEN_CARRIER_SATS` = `legacy_carrier_sats(LEGACY_CARRIER_SEND_DEPTH)` =
 `5 · (TOKEN_PIECE_SATS + 300) + 666` = **22 536**. Each flat send consumes one
 `TOKEN_PIECE_SATS`-sized piece plus a floored fee reserve, and the last change must still clear the
-sub-coin floor `min_split_output` (666 sat at the committed 3 sat/vB). So a stock carrier affords
-**five chained sends** on the legacy flat lane — the size is derived from that lane's depth, and it
-is kept for the networks still on it. On the coloured lane the same 22 536 buys exactly **one** send,
+sub-coin floor `min_split_output` (666 sat at the committed 3 sat/vB). So a stock carrier was sized for
+**five chained sends** on the legacy flat lane — the size is derived from that lane's depth, and the
+constant is kept although the lane is retired (2026-09-06: no network is on it). On the coloured lane the same 22 536 buys exactly **one** send,
 with the rest landing in a depth-1 change child that can only be moved whole or exited — a real cost
 of that lane, not a rounding.
 
 `issue_token_sized`, `issue_inflatable_token_sized` and `mint_tokens_sized` take the carrier's sats
-as an argument. They exist to reproduce and migrate **under-sized** carriers — a carrier funded
-below the coloured root floor can never be laddered, and the migration hatch that serves that class
-needs a way to construct it — not as a knob for ordinary issuance.
+as an argument. They exist to reproduce **under-sized** carriers — a carrier funded below the
+coloured root floor (`colored_ladder_floor` = `3 · 744 + 330` = **2 562** at the shipped 3 sat/vB)
+can never be laddered — not as a knob for ordinary issuance. Note that the migration hatch these were
+originally written to feed is **closed**: `refuse_legacy_colored_split_lane` refuses that lane on
+both settings of `colored_ladder`, so there is now no route that serves an under-sized carrier.
+Re-funding above the floor is the only answer.
 
 Two practical consequences of the carrier being a special coin:
 
@@ -83,11 +89,14 @@ Two practical consequences of the carrier being a special coin:
 - **It never gets a *plain* ladder.** Where `colored_ladder` is on it gets a coloured one and
   `LadderEstablished` fires; where it is off no ladder event fires at all and `claim()` records
   `LadderSkipReason::RgbCarrier` instead, readable back through `ladder_skip_reason` /
-  `flat_only_coins`. Read the `may_still_be_transferred` element rather than assuming it: that reason
-  used to license a flat whole-coin conveyance and **no longer does** — the licence was retired with
-  the un-laddered shape, on the ground that "this coin is an RGB carrier" stops being a reason a coin
-  may travel without a ladder once carriers are laddered. Distributing the asset is a colored split
-  (below), not a whole-coin handover, so it is a different question from this one.
+  `flat_only_coins`. The `may_still_be_transferred` element is **always `false`** now
+  (`is_legitimate_flat_reason` returns `false` unconditionally): that reason used to license a flat
+  whole-coin conveyance and no longer does, and there is no other lane behind it. The one carrier
+  state that is worse is `PlainLadderOverCarrier` — tokens moved onto an outpoint that was already
+  plain-laddered. Its plain trigger is a plain spend of a sealed output, its tiers cannot be
+  unsigned, `colored_reanchor` refuses a plain ladder by name and a plain `refresh` would destroy the
+  allocation: **there is no remedy**, and the allocation is stranded. Under laddering-at-first-sight
+  every confirmed plain deposit is a plain-laddered outpoint, so never move an allocation onto one.
 
 ## Inflatable supply (IFA): mint and burn
 
@@ -113,7 +122,8 @@ binds only what is new, so a mint can never consume already-bound supply (REQ-20
 
 An NIA has no post-issuance mint: its supply is fixed by the contract at issuance. Issue an IFA if
 you need inflation, and declare the rights up front — holders read them off the contract. Issue →
-mint → distribute is verified end to end by `sdk09`.
+mint → distribute was verified end to end by `sdk09` on the retired flat lane (re-derivation to the
+coloured in-ladder split pending).
 
 After a mint you hold the asset across **two carriers**. That is normal; distribution handles it
 (see combine, below).
@@ -121,32 +131,44 @@ After a mint you hold the asset across **two carriers**. That is normal; distrib
 ## Distribute
 
 ```rust
-// Single recipient — off-chain, instant.
+// Single recipient — off-chain, instant. This is the only shape that works today.
 issuer.transfer_tokens(&asset_id, &user_address, 5_000).await?;
 
-// Many recipients — ONE SE-co-signed colored split carves one exact piece per recipient plus your
-// change; each piece ships its own consignment. One TransferResult per recipient, in order.
+// Many recipients — REFUSED. See below: `refuse_colored_multi_payee` refuses K > 1 by name on the
+// coloured lane, and the legacy N-piece lane behind it is retired. Pay one carrier per recipient.
 let results = issuer
-    .batch_transfer_tokens(&asset_id, &[(bob_address.clone(), 200), (carol_address, 300)])
+    .batch_transfer_tokens(&asset_id, &[(bob_address.clone(), 200)])
     .await?;
 ```
 
-**Which lane those two calls take is decided by `colored_ladder`, and the rest of this section
-describes the flat one.** Where the flag is on, the carrier is laddered and `transfer_tokens` runs the
-**coloured in-ladder split** instead: a coloured `SP` over `X_m`'s payload output — a descendant of
-the trigger, never a rival for `F` — carving a coloured child per recipient, each with its own
-headless coloured ladder (`sdk02`, `sdk29`, `sdk77`). Two differences worth knowing before you read
-on: there is no combine transaction on that lane (`sdk31` — each carrier's `F` is already spent by
-its own trigger, so paying across carriers is one in-ladder split per carrier), and a received
-coloured child carries no `branch-` row at all, its exit material being the five-tier `ctesr-` chain.
+**Distribution runs on the coloured in-ladder lane, and there is no second lane behind it.** Where
+`colored_ladder` is on, the carrier is laddered and `transfer_tokens` runs the **coloured in-ladder
+split**: a coloured `SP` over `X_m`'s payload output — a descendant of the trigger, never a rival for
+`F` — carving a coloured child for the payee plus a coloured spine tip for you, each with its own
+headless coloured ladder (`sdk02`, `sdk29`, `sdk77` — all pending run). Where it is off, the call
+**refuses**: `refuse_legacy_colored_split_lane` refuses the legacy lane on *both* settings of the
+flag, so there is nothing to fall through to.
 
-What a distribution does on the **flat** lane: every input carrier is terminalized at the SE (one
-final co-signature), the colored split is co-signed once, and each piece becomes a fresh sub-coin
-carrying `TOKEN_PIECE_SATS` = **4 074** sats of packaging plus the exact token amount as payload.
-Each piece gets its **own fresh signed-once backup at the full initial locktime** — no ladder
-mechanics enter this path, which is why an issuer keeps distributing no matter how long the carrier
-has been sitting. Holders receive, validate the consignment client-side, and re-transfer with the
-standard wallet SDK; there is no issuer involvement after issuance.
+Two properties of the coloured lane worth knowing before you design around it. **There is no combine
+transaction** (`sdk31`): each carrier's `F` is already spent by its own trigger, so paying across
+carriers is one in-ladder split per carrier, executed sequentially and **not atomically** — a failure
+on leg `k` leaves legs `0..k` conveyed, and the error names every piece already handed over. And a
+received coloured child carries **no `branch-` row at all**; its exit material is the five-tier
+`ctesr-` chain.
+
+**`batch_transfer_tokens` is one recipient only.** Every coloured send funnels through
+`colored_in_ladder_pay`'s engine, whose first act is `refuse_colored_multi_payee`, and that refuses
+`K > 1` by name. This is a **shipped decision** (D43, taken 2026-08-13), not a block pending a fix:
+the coloured lane conveys its pieces serially after the carrier is already terminal and journals no
+`recipient_address`, so a failure at payee `j` strands pieces `j..K` with the sender holding their
+keys and no route to the recipients. Size carriers to the value you intend to move and pay one
+carrier per recipient. The legacy lane that DID serve `K > 1` — one `create_colored_split_tx` over
+`F` carving `TOKEN_PIECE_SATS` = **4 074**-sat pieces, each with its own signed-once backup — is
+retired: it is refused before any co-sign, and the sub-coins it made were exited by a flat backup
+chain that no longer exists.
+
+Holders receive, validate the consignment client-side, and re-transfer with the standard wallet SDK;
+there is no issuer involvement after issuance.
 
 **Why 4 074 and not a round number.** The piece is a coin like any other: its receiver claims it,
 and if the carrier is coloured that claim wants a coloured root ladder. A coloured rung costs
@@ -160,20 +182,24 @@ distributing does not burn paid onboarding tokens the way issuance does. The coo
 most `max_derived_tokens_per_statechain` of them per parent, counted over the parent's lifetime with
 spent rows included (default 64), which bounds how many recipients one carrier can ever serve.
 
-If no single carrier holds the amount — the normal case after a mint — the SDK **combines** several
-carriers of the same asset into one SE-co-signed colored combine tx (N inputs → exact piece +
-change), largest allocation first. The receiver then validates the multi-input branch and requires
-**all N input carriers** to be terminal — one terminal ancestor per structural input, enforced by
-`transfer_receiver::verify_terminal_parents` (`sdk31`). Token conservation across the whole
-operation is INV-13: `Σ recipient amounts + change = Σ allocations of the combined inputs`.
+If no single carrier holds the amount — the normal case after a mint — there is **no combine
+transaction**. `colored_multi_carrier_transfer` runs one coloured in-ladder split per carrier and
+conveys one coloured child per leg to the same recipient, who books them as separate allocations that
+sum to the amount. That is not a workaround for a missing combine: each carrier's `F` is already
+spent by its own coloured trigger, and no coloured tier has several parents (`SP` spends exactly one
+`X_m`). RGB value conservation holds per split and the recipient's balance is the sum, which is what
+the legacy combine delivered — but the legs are **not atomic**, and the error names every leg already
+conveyed so the caller can finish or refund deliberately. `sdk31` is the flow, re-derived onto this
+shape and **pending run**. The legacy multi-input combine behind it (whose receiver required all N
+input carriers to be terminal, `transfer_receiver::verify_terminal_parents`) is refused before it is
+reached.
 
-A distribution is refused **before** anything is co-signed rather than stranding the carrier:
-
-- the carrier must cover `TOKEN_PIECE_SATS + fee reserve`, where the reserve is 1 % of carrier value
-  clamped to 300–2 000 sats;
-- both outputs must stay above `min_split_output` at the *live* backup feerate — a sub-coin has to
-  be able to fund its own backup. At high feerates the transfer errors out with the carrier
-  untouched.
+A distribution is refused **before** anything is co-signed rather than stranding the carrier — the
+coloured lane checks its floors and its `K > 1` rule ahead of the first SE call, and the legacy lane
+is refused outright. On the legacy lane the checks were: the carrier covering
+`TOKEN_PIECE_SATS + fee reserve` (the reserve being 1 % of carrier value clamped to 300–2 000 sats),
+and both outputs staying above `min_split_output` at the *live* backup feerate. Those still run, but
+only after a refusal that always fires first.
 
 Token amounts are **raw u64 units**; `precision` is contract metadata the SDK never scales
 (`sdk29`). `transfer_tokens(&asset, &addr, 5_000)` on a precision-2 asset moves 5 000 raw units =
@@ -203,8 +229,8 @@ stock has been invalidated underneath it; the allocation list is the per-outpoin
 | `createToken(isFreezable, maxSupply…)` | `issue_token` (NIA) / `issue_inflatable_token` (IFA) | metadata immutable, as in Spark; NIA supply fixed at issuance, IFA declares its inflation rights up front |
 | `mintTokens` | `mint_tokens` | IFA only: on-chain inflate + bind to a fresh carrier (`sdk09`); an NIA declares no inflation right, so it has nothing to realize |
 | `burnTokens` | `burn_tokens` | on-chain, engine-held balance only; statechain-bound supply must exit first |
-| `transferTokens` | `transfer_tokens` | coloured in-ladder split where `colored_ladder` is on; colored off-chain split + backup-chain handover where it is off |
-| `batchTransferTokens` | `batch_transfer_tokens` | one colored split, N pieces + change (`sdk09`) |
+| `transferTokens` | `transfer_tokens` | coloured in-ladder split where `colored_ladder` is on; where it is off the legacy colored split + backup-chain handover cannot complete (`register_split_subcoins_n` refuses by name, 2026-09-06) |
+| `batchTransferTokens` | `batch_transfer_tokens` | **one recipient only.** A coloured carrier refuses `K > 1` by name (`refuse_colored_multi_payee`, shipped decision D43); the legacy one-split-N-pieces lane behind it is retired and refuses first (`refuse_legacy_colored_split_lane`, then `register_split_subcoins_n` / `register_combine_subcoins`). The call still exists and still works for `K = 1` (`sdk09`: premise retired, re-derivation pending) |
 | `freezeTokens` | **intentionally absent** | client-validated assets have no consensus-meaningful freeze; see [tokens](../learn/tokens.md) |
 | `getIssuerTokenBalance` | `get_token_balances` | |
 | `getTokenL1Address` | `get_token_l1_address` | alias of `get_token_funding_address` |
@@ -225,15 +251,17 @@ stock has been invalidated underneath it; the allocation list is the per-outpoin
   `unilateral_exit` exclude carriers from their defaults and hard-error if a carrier is named
   explicitly. `refresh` (the on-chain re-anchor) likewise rejects a coin holding an allocation, and
   the maintenance refresh pass skips carriers.
-- **A received piece SETTLES without the SE.** Token exit means **materializing the branch**:
+- **A received piece SETTLES without the SE.** On the coloured lane that is the five-tier walk of its
+  `ctesr-` bundle, moving the allocation to the holder's own key (`sdk75`). For a piece from the
+  retired flat lane (before 2026-09-06) it meant **materializing the branch**:
   broadcasting the stored `branch-<id>` rows, which for a carrier *are* the un-broadcast coloured
   split/combine transactions — the RGB witnesses that carved the allocation. Landing them root-first
   settles the allocation on a confirmed outpoint and spends the shared root, with no SE involved. It
   works at depth: a piece two colored splits deep materializes by broadcasting `[split1, split2]`
-  root-first (`sdk39`). The automatic route is `auto_exit_due`, which broadcasts the branch and only
-  the branch — never the plain backup, which would sweep the sats and destroy the allocation.
+  root-first (`sdk39`). The automatic route for such legacy rows is `auto_exit_due` (legacy subject only), which
+  broadcasts the branch and only the branch; there is no plain backup to sweep with.
   **Materializing settles the asset; it does not exit the coin.** The sats stay on the 2-of-2
-  outpoint, so moving them onward still needs the SE. That is the flat lane's ceiling, and it is why
+  outpoint, so moving them onward still needs the SE. That was the flat lane's ceiling, and it is why
   the coloured ladder matters: where `colored_ladder` is on the carrier has a real unilateral exit
   (`sdk75` walks a coloured `T → X_0 → S_0` to confirmation with the allocation intact), and where it
   is off — a network with no enclave yet — it does not. `unilateral_exit` refuses this class by name
@@ -247,52 +275,65 @@ stock has been invalidated underneath it; the allocation list is the per-outpoin
 
 Tokens are never lost by inactivity: `sdk32` idles the chain a "year" past every deployed horizon
 and the stock still validates the full allocation afterwards. Read its lane label, though — `sdk32`
-asks for `colored_ladder = true`, so it measures the *coloured* form of that claim. The flat carrier
-shape is the one `sdk52` pins (plain coin laddered, carrier not) and `sdk39` exits; that is now the
-shape of a network still waiting for its enclave rather than of the regtest default.
+asks for `colored_ladder = true`, so it measures the *coloured* form of that claim. The no-ladder carrier
+shape is the one `sdk52` pins (plain coin laddered, carrier not — and since 2026-09-06 with nothing
+underneath) and that `sdk39` used to exit through the retired branch lane (re-derived, pending run);
+it is the shape of a network still waiting for its enclave, not of the regtest default.
 
-A calendar exists here — but not *only* here. A plain laddered coin also keeps an absolute flat
-backup chain and therefore a `min(L_k)` its prior owners hold; what a carrier with no ladder lacks is
-the CSV tier chain that makes the *exit* calendar-free. So the difference is the remedy available,
-not the existence of a deadline.
+No calendar exists here — or anywhere (2026-09-06). No coin, plain or carrier, keeps a flat backup
+chain, so there is no `min(L_k)` a prior owner holds and nothing on a coin matures on its own; what a
+carrier with no ladder lacks is not a calendar-free exit but **any** exit (TRUST-MODEL B12). So the
+difference between the lanes is whether exit material exists, not the existence of a deadline.
 
-**Your issued or minted carrier is flat**: funded on chain, with no ancestor above it. It has no
-ladder to age on and no ancestor that could claw it back, so it carries no deadline duty at all —
-`auto_exit_due` inspects it and correctly skips it. It does hold its one signed-once deposit backup,
-maturing at `deposit_height + initlock` (10 000 blocks on the mainnet, testnet and signet profile;
-1 000 on regtest), but that maturity does not gate distribution: a colored split never touches a
-ladder and mints fresh full-locktime backups for its outputs. The standing limitation is
-cooperative-only movement — a plain unilateral exit is refused, so an issued carrier's supply stays
-where it is until the SE co-signs a colored spend.
+**Your issued or minted carrier without a coloured ladder is a coin with no exit material**: funded
+on chain, with no ancestor above it and no ancestor that could claw it back, so it carries no
+deadline duty at all — `auto_exit_due` inspects it and correctly skips it. It holds no signed-once
+deposit backup (none is co-signed for any coin; `deposit_height + initlock` matures nothing, and
+`initlock` survives only as a compatibility constant). Distribution from it cannot complete either:
+the colored split that used to mint fresh-backup outputs dies at `register_split_subcoins_n`. The
+standing limitation is therefore holding only, until an identity is pinned and a later `claim()`
+pass colours the carrier — after which it pays by coloured in-ladder split and walks its own ladder.
 
-**A holder's received piece on the flat lane is a sub-coin carrier** — held off the ladder twice
-over: a carrier (terminal freeze) *and* a split sub-coin whose funding is un-broadcast, which cannot
-root a trigger. That second half is permanent and survives every change to the first: colouring a
+**A holder's received piece from the retired flat lane (before 2026-09-06) is a sub-coin carrier** —
+held off the ladder twice over: a carrier (terminal freeze) *and* a split sub-coin whose funding is
+un-broadcast, which cannot root a trigger. That second half is permanent and survives every change
+to the first: colouring a
 tier cannot broadcast a funding output, so an off-chain sub-coin's funding stays un-broadcast on
-every lane, and its `branch-` rows stay its only way down. It can be
-materialized SE-free at any time while the shared root is unspent. It does have a root deadline:
-past it, the *sender's* signed-once backup matures and a malicious sender could sweep the shared
-funding. Holders using this SDK are protected by default — the `auto_exit_due` watchtower
-(`SdkConfig::auto_exit`, run by `start_background`) materializes the carrier as the deadline nears —
-broadcasting **only** the stored exit branch, never the sats-sweeping backup — and emits
-`WalletEvent::TokenCarrierMaterialized` (SPEC REQ-33). An issued/flat carrier has no exit branch, so
-the pass verifies that and skips it. `sdk34` is the E2E for the duty, and it runs with
-`colored_ladder = true`: there a received piece is a coloured child with no `branch-` row at all, so
-the same duty is discharged by walking its pre-signed tier chain instead. The duty and the event are
-the same; the action is what the lane decides.
+every lane. Its `branch-` rows are the only SE-free thing it can still do — and what they do is
+SETTLE THE ALLOCATION, not exit the coin: `unilateral_exit` has no arm that broadcasts them and
+refuses such a coin by name, and `has_exit_material` no longer counts them. It can be
+materialized SE-free at any time while the shared root is unspent — and it has **no** root deadline
+(2026-09-06): no sender holds a signed-once backup that matures, so nothing can sweep the shared
+funding on a date. The only spends of the shared root in anyone's hands are un-timelocked triggers,
+which a holder's watcher answers by walking, and superseded states that lose the CSV race. For such a
+legacy piece the `auto_exit_due` watchtower (`SdkConfig::auto_exit`, run by `start_background`) still
+materializes the branch — only the branch — and emits `WalletEvent::TokenCarrierMaterialized` (SPEC
+REQ-33 is RETIRED; this arm reads rows no lane mints). An issued carrier has no exit branch, so the
+pass verifies that and skips it. `sdk34`, which drove the duty against a deadline, is re-derived to
+the event-driven defence — pending run; on regtest a received piece is a coloured child with no
+`branch-` row at all, defended by `defend_ladders` walking its pre-signed tier chain when the
+parent's `F` is spent.
 
 The duty is delegable, keyless, via `export_watch_bundle` (`sdk45`). The exported bundle carries
-**no key material**, a second independent tower is idempotent, and a `WatchEntry` with
-`token_carrier: true` is exported *without* its `backup_tx` — a delegated tower can only ever
-materialize the branch, never sweep and destroy the allocation. The export fails closed for a token
-wallet whose carriers cannot be enumerated, because a carrier mis-exported as plain would hand the
-tower a token-destroying backup.
+**no key material**, a second independent tower is idempotent, and every `WatchEntry` it can emit is
+exported *without* a `backup_tx` (none exists) and event-driven (`deadline_block: u32::MAX`) — a
+delegated tower can only ever drive the pre-signed walk, never sweep and destroy the allocation.
+Note what that costs. Since the height-keyed arm was deleted, a coin whose only material is a legacy
+`branch-` chain gets **no entry at all**: it is omitted from the bundle and reported by
+`flat_only_coins` instead, so materializing such a piece is the owner's own job
+(`materialise_carrier`, or the in-process `auto_exit_due`) and never a delegated tower's. The export
+fails closed for a token wallet whose carriers cannot be enumerated, because a carrier mis-exported
+as plain would hand the tower a token-destroying backup.
 
-**Advice worth putting in your holder docs:** hold, combine, or materialize — never "refresh before
-your locktime expires" (refresh does not apply to carriers) and never a plain unilateral exit. Warn
-too that a lone piece can be below the bar to move on its own: escaping a carrier costs
-`TOKEN_PIECE_SATS + fee_reserve + min_split_output` = **5 040 sats** of aggregated carrier value, so
-a holding under that must be combined with another piece of the same asset first.
+**Advice worth putting in your holder docs:** hold, or (for a legacy piece) materialize — never
+"refresh before your locktime expires" (there is no locktime, and `refresh` refuses a carrier
+outright) and never a plain unilateral exit. Do **not** advise "combine": the legacy multi-carrier
+combine is retired and the coloured lane has no combine transaction at all. The
+`TOKEN_PIECE_SATS + fee_reserve + min_split_output` = **5 040 sats** "cost of escaping a carrier"
+figure describes that retired lane's arithmetic and is kept here as history, not as guidance; on the
+coloured lane the binding number is the coloured root floor
+(`3 · 744 + 330` = 2 562 at the shipped 3 sat/vB), below which a carrier can never be laddered and
+therefore has no exit material at all.
 
 ## Where next
 
@@ -306,4 +347,5 @@ a holding under that must be combined with another piece of the same asset first
 - [PARTIAL-PAYMENT-ECONOMICS.md](../spec/PARTIAL-PAYMENT-ECONOMICS.md) — what the coloured lane
   costs, measured.
 - [Testing guide](testing-guide.md) — running the token E2Es (`sdk02`, `sdk09`, `sdk29`, `sdk31`,
-  `sdk32`, `sdk34`, `sdk36`, `sdk39`, `sdk52`, `sdk78`).
+  `sdk32`, `sdk34`, `sdk36`, `sdk39`, `sdk52`). `sdk78` was DELETED with the retired lane, and
+  `RGB_E2E=1, 2, 3, 5, 6, 8, 9, 10` with it — do not put those ids in a run list.

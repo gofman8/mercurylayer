@@ -5,6 +5,10 @@
 > [CHILDREN.md](../spec/CHILDREN.md) (first-class received children) and
 > [SPEC.md](../spec/SPEC.md) §5–§6 (the requirements). What a payment costs is priced in
 > [PARTIAL-PAYMENT-ECONOMICS.md](../spec/PARTIAL-PAYMENT-ECONOMICS.md).
+>
+> The `sdkNN` citations name E2E flows against the regtest stack. The unit suites are green and the
+> E2E crate compiles, but **no E2E flow has been run since the flat backup chain was removed on
+> 2026-09-06** — they were re-derived, not re-measured. Read them as pending run.
 
 ## A transfer is a key handover
 
@@ -18,9 +22,10 @@ fee, sub-second, fully async.
 Three steps, and **the order is load-bearing**:
 
 1. **The sender pre-signs everything first.** `transfer_sender::execute`
-   (`clients/libs/rust/src/transfer_sender.rs`) builds the receiver's flat backup
-   (`create_backup_transactions` → `create_tx1`) and, on a laddered coin, co-signs the
-   receiver-paying state `S'` (`presign_receiver_state`). None of that needs `x1`.
+   (`clients/libs/rust/src/transfer_sender.rs`) co-signs the receiver-paying state `S'`
+   (`presign_receiver_state`; `cosign_colored_receiver_state` on a coloured ladder) — and only that.
+   No flat backup is built for the receiver (`create_backup_transactions` / `create_tx1` are deleted,
+   2026-09-06), and a coin with no ladder row is refused by name. None of that needs `x1`.
 2. **The sender opens the transfer** — `POST /transfer/sender` (`get_new_x1`) — then
    `create_transfer_update_msg` posts the ECIES-encrypted conveyance to the coordinator's mailbox
    through `POST /transfer/update_msg`. Opening arms the **pending-transfer lock**: from here the
@@ -43,30 +48,29 @@ receiver-verification set across a transfer), `sdk01`.
 
 | tag | shape |
 |---|---|
-| `0` | branch + backup-chain message — the flat lane |
+| `0` | *(retired 2026-09-06)* the branch + backup-chain message of the flat lane — not in `ADMISSIBLE_PROTOCOL_VERSIONS = [2, 4]`, refused by name |
 | `2` | a conveyed TES-R ladder — a whole laddered coin |
 | `4` | a split-child bundle carrying the key handover (`SHAPE_CHILD`) |
 
-`ADMISSIBLE_PROTOCOL_VERSIONS = [0, 2, 4]` is an **exact set**, checked by `admissible_shape`
+`ADMISSIBLE_PROTOCOL_VERSIONS = [2, 4]` (since 2026-09-06) is an **exact set**, checked by `admissible_shape`
 (`clients/libs/rust/src/transfer_receiver.rs`), so an unknown tag is refused *by name* rather than
 read as "at least". The child gates — the pre-pay census `prepay_child_census` and the claim path's
 `validate_encrypted_message` — each call it and then require exactly `SHAPE_CHILD`.
 
-Tag `0` is still an admissible *receive* shape, and deliberately: a receiver must keep understanding
-a message a legacy or pre-SDK wallet emits. What has changed is the *send* side. The two licences
-that let an ordinary coin travel flat — `licence_rgb_carrier` (an RGB carrier) and
-`licence_funding_not_onchain` (a sub-coin over un-broadcast funding) — are **retired**, along with
-their `PermanentLicence` variants (`clients/libs/rust/src/transfer_sender.rs`), because a carrier is
-laddered now and the plain split that produced the other is deleted. What still licences a flat
-conveyance is narrower, and each is established from *positive* evidence rather than from a recorded
-string: a `single_use` terminalized carrier (the coin's own flag), a pre-migration-0009 coin the
-coordinator answers about with no aggregate on record (re-proved live, that call), and a wallet
-carrying no ladder artefact of any kind and therefore provably never through the SDK's ladder pass.
+Tag `0` is **not** an admissible receive shape any more (2026-09-06): the branch + backup-chain
+message no longer exists and cannot be received — a receiver has nothing to verify it against, since
+no coin carries a flat backup, and `refuse_branch_material` / `verify_flat_backup_lane` refuse the
+material by name. The send side is closed the same way: the flat conveyance lane and its licence
+classifier (`assert_flat_conveyance_is_legitimate`, `PermanentLicence` — and before them
+`licence_rgb_carrier` / `licence_funding_not_onchain`) are deleted from
+`clients/libs/rust/src/transfer_sender.rs`; `is_legitimate_flat_reason` answers `false` for every
+recorded reason, and `transfer_sender::execute` refuses a coin with no ladder row by name. Nothing
+licences a flat conveyance, because there is nothing flat to convey.
 
 Residual, and stated in [CHILDREN.md](../spec/CHILDREN.md): the **sender** declares the tag. The
 uniffi FFI strips `protocol_version`, `tesr_ladder` and `child_tesr_bundle` on its way through, and
-exact-set dispatch is what makes a stripped tag fail **closed** instead of landing silently on the
-flat census. What is missing is a floor the *receiver* sets.
+exact-set dispatch is what makes a stripped tag fail **closed** instead of landing silently on a
+lane with no census (the retired shape `0`). What is missing is a floor the *receiver* sets.
 
 ## Whole laddered coin: replace-by-lower-timelock
 
@@ -114,8 +118,12 @@ and does not need to — `/info/config` serves only `initlock`, `interval`, `bat
 **The census.** `verify_bundle_bound` enforces an *exact equality*:
 
 ```
-se_num_sigs == flat_backups + Σ conveyed tiers + Σ disclosed superseded tiers
+se_num_sigs == Σ conveyed tiers + Σ disclosed superseded tiers
 ```
+
+The flat term is **zero by construction** (`PARENT_V2_BASELINE = 0`, `CHILD_V2_BASELINE = 0`): no
+coin carries a flat backup, and a conveyed `backup_transactions` vector is REQUIRED to be empty
+(`verify_flat_backup_lane`, `refuse_conveyed_flat_backups`) — refused before the count is taken.
 
 Any undisclosed rival state raises the left-hand side and nothing on the right, so it shows up as a
 count mismatch and the claim is rejected. Each disclosed superseded tier must be parsed, linked to
@@ -134,7 +142,8 @@ otherwise **refuse**, because a client with no key to check the signature agains
 to accepting the key the coordinator serves alongside it.
 
 Two things to say plainly about the shipped state. `attestation_identity_const` pins **regtest's**
-identity and returns `None` for mainnet, testnet and signet, where no enclave is provisioned. Regtest
+identity and returns `None` for mainnet and for every public testnet (`testnet`, `testnet3`,
+`testnet4`, `signet`), where no enclave is provisioned. Regtest
 can be pinned precisely because the out-of-band channel is the repository itself — the dev seed is in
 the tree, so `TesrParams::REGTEST_ATTESTATION_IDENTITY` is a fact about the source rather than about
 whichever server happens to answer, and a unit test re-derives it and fails if either the seed or the
@@ -146,34 +155,49 @@ there is no mainnet enclave yet, and a *wrong* pin refuses every attestation whi
 identity is pinned rather than chain-anchored because a deep split ancestor's funding output is
 deliberately un-broadcast, so there is nothing on chain to bind to.
 
+**What "no identity" now costs, on the lane a wallet user is on.** Since 2026-09-06 it costs the
+*exit*, not just the receive. The SDK `claim()` establish pass calls `get_statechain_info` for every
+root coin, because it needs the coordinator's aggregate to bind the ladder against; with no pin and
+nothing configured that call fails and the pass records
+`LadderSkipReason::AttestationIdentityUnpinned` and ladders **nothing** — coloured carriers and plain
+coins alike. The deposit is still booked, but it has no exit material: `transfer_sender::execute`
+refuses to convey it and `unilateral_exit` refuses to walk it, so **cooperative withdrawal is the
+only route out**. The flat backup used to supply that unilateral exit with no attestation involved;
+it no longer exists. (The mercuryrustlib `update_coins` lane — `LadderAtSight::Plain`, used by the
+CLI — makes no such call: `tesr::establish_auto` and `cosign_tier` do not read
+`get_statechain_info`, so that lane ladders without a pin.) No mainnet enclave is provisioned at all,
+so this describes a not-yet-deployable state rather than a live regression.
+
 *Evidence:* `sdk46` (the formula against the real SE counter), `sdk47` (R′ across a transfer),
 `sdk54` (adversarial `verify_bundle`), `sdk55` (backup-chain adversarial), `sdk70` (verifier
 binding), `sdk76` (the ancestor census on a *received* parent that is then split), `sdk56` (a
 repeated `sign/second` returns the cached partial and does not advance the count, so a retry cannot
 brick the equation).
 
-## The calendar that survives laddering
+## There is no calendar — the flat backup chain is retired (2026-09-06)
 
-Laddering deletes the **CSV-side** ageing and nothing else. Alongside the ladder every coin keeps
-its **flat backup chain**: one signed-once backup per owner, at absolute locktimes
-`L_k = L_0 − k·interval` (INV-5, enforced on both shapes). Mainnet `initlock` is 10,000 blocks and
-`interval` is 100 — 100 hops of capacity — from `TesrParams::flat_ladder_params`
-(`lib/src/tesr.rs`), which is compiled in per network precisely because a coordinator that could
-choose `interval` would be choosing the defence against backup-vector padding.
+Laddering does not delete the CSV-side ageing "and nothing else": there is nothing else. No coin
+carries a flat backup chain — `create_tx1` is deleted, no hop co-signs a receiver-paying backup, and a
+transfer message that conveys one is refused by name — so there are no absolute locktimes
+`L_k = L_0 − k·interval`, no `min(L_k)` held by prior owners, and `coin.locktime` is `None` for life.
+INV-5 is RETIRED (there is no chain to decrement) and INV-27 is unconditional: nothing on a coin
+matures on its own, however many times it has been received. `initlock` / `interval` survive in
+`TesrParams::flat_ladder_params` (`lib/src/tesr.rs`) and `/info/config` only as compatibility
+constants — `initlock` is the fixed exit window the split-depth cap measures against, `interval` is
+applied to nothing — and the client still refuses a coordinator whose copy disagrees.
 
-So a coin that has been received `k` times sits on `min(L_k)`: a real, finite, approaching height
-held by its **prior owners**, whatever its ladder is doing. `sdk86` measures both clocks on one coin
-across three owners — the ladder fingerprint is byte-identical after 300 idle blocks, while the
-absolute locktime is 300 blocks nearer and each whole-coin hop spends another `interval` of it.
-Defending that height is [exits](exits.md)' business.
+What bounds a received coin's off-chain life is its renewal/rollover budget, spent by hops, and the
+on-chain cadence is the cooperative re-anchor at that cap. *(`sdk86`, which measured "both clocks" on
+one coin across three owners, is re-derived to assert no calendar at any hop — pending run.)*
+Defending the one clock that exists — the reactive CSV race after a public trigger — is
+[exits](exits.md)' business.
 
 ## Paying an arbitrary amount: the in-ladder split
 
 `transfer(address, amount)` never asks you to think about coins.
 
 - **Exact subset.** If some subset of your coins sums to the amount, each is handed over whole.
-  This is rare in practice: `min_child_value` is the finest piece the protocol will mint, so an
-  arbitrary amount's residue essentially never lands on a subset sum
+  This is rare in practice: an arbitrary amount essentially never lands on a subset sum
   ([PARTIAL-PAYMENT-ECONOMICS.md](../spec/PARTIAL-PAYMENT-ECONOMICS.md) §1.2).
 - **In-ladder split** — the common case, and therefore the real payment path.
 
@@ -205,15 +229,39 @@ The legs are floored independently, by lane. `split_output_floors`
 (`clients/libs/rust-sdk/src/transfer.rs`) is the one place either number is derived; it returns a
 `SplitFloors { piece, change, lane }` carrying the lane with the numbers, and what the change leg's
 shape is on that lane is `change_leg_role`'s answer (`clients/libs/rust/src/tesr.rs`), never a
-constant chosen at the call site:
+constant chosen at the call site.
 
-| leg | shape | floor | at the shipped rate |
+The **change** leg is floored at the shape its lane really builds:
+
+| change leg | shape | floor | at the shipped rate |
 |---|---|---|---|
-| **piece** | two rungs (its own extension + state) | `min_child_value = 2·(committed_fee + 240) + 330` | **1,560 sat** |
-| **change** on the plain-root, spine-batch and coloured lanes | one cap rung over `SP.out[K]` | `min_spine_tip_value = committed_fee + 240 + 330` | **945 sat** |
-| **change** on the plain-child lane | two rungs | `min_child_value` | 1,560 sat |
+| plain-root, spine-batch and coloured lanes | one cap rung over `SP.out[K]` | `min_spine_tip_value = committed_fee + 240 + 330` | **945 sat** |
+| plain-child lane | two rungs | `min_child_value = 2·(committed_fee + 240) + 330` | **1,560 sat** |
 
-Both are `mercurylib::tesr` functions taking the rate as an **argument**, and
+The **piece** is not, and this is [REQ-83]. `split_output_floors` admits it at
+`SplitLegRole::Tail.min_value` = **1 satoshi**, because flooring admission at 1,560 made every amount
+below that unpayable while cheaper leg shapes existed. What the payee's leg is *built* as comes from
+the same `LeafShape::for_value` the floor reads, so admission and construction cannot be two answers:
+
+| leaf band | value at the shipped rate | what it carries | exits unaided? |
+|---|---|---|---|
+| `Piece` | ≥ 1,560 sat (`min_child_value`) | its own extension + state | yes |
+| `ThinPiece` | 945 – 1,559 (`min_spine_tip_value`) | one cap rung, no extension — so a re-anchor, not a renewal, resets it | yes |
+| `Stub` | 330 – 944 (`DUST_LIMIT` up) | nothing: `SP.out[j]` pays the payee's **own key** and *is* the claim — no rung, no SE slot, no statechain id | no |
+| `Tail` | 1 – 329 | nothing, and it is coin-backed (it holds an SE slot, because the release fragment must be co-signed while the sender still holds it); at most **one** per split | no |
+
+The bottom two bands settle when their group does; `LeafShape::exits_unaided` says so, and it is
+exposed so a caller can tell the user what they are buying, never so a caller can refuse the payment.
+A stub must be passed through `in_ladder_split`'s `ladderless` argument — the single-recipient
+`in_ladder_pay` lane passes none, so a stub-band amount is refused there **by name**, ahead of both
+`set_spend_budget` and the `SP` co-sign, so the parent is not terminalized. `in_ladder_pay_many` does
+pass them and routes a stub recipient to a ladderless leg — but its public entry point
+`transfer_many` still refuses any recipient below `min_split_output` (= `DUST_LIMIT` + a 112-vB
+backup fee at the live rate), a floor inherited from the retired flat lane and named after a backup
+transaction that is no longer built. So the lower bands are reachable in the split builder and only
+partly reachable through today's wallet API.
+
+The floor functions are `mercurylib::tesr` functions taking the rate as an **argument**, and
 `TesrParams::mainnet()` ships `committed_fee_rate = 3.0` sat/vB with `TIER_VBYTES = 125`, so
 `committed_fee = 375`. Quoting one of these numbers without its rate is quoting a rate, not a floor.
 
@@ -277,9 +325,10 @@ off-chain:
 The rule is uniform at every level: **the node being split is terminalized; the piece being conveyed
 is not.**
 
-The receiver's protection generalises to N hops with the same three terms, summed across the
-conveyed ancestor chain — and `CHILD_V2_BASELINE = 0`, because a derived child slot never ran
-`create_tx1` and therefore has no flat backup of its own. *Evidence:* `sdk60`
+The receiver's protection generalises to N hops with the same two terms (tiers + disclosed
+superseded), summed across the conveyed ancestor chain, with the flat term zero at every slot —
+`PARENT_V2_BASELINE = 0` and `CHILD_V2_BASELINE = 0`, because no slot, root or child, ever runs a flat
+co-sign (`create_tx1` is deleted). *Evidence:* `sdk60`
 (alice → bob → carol, whole re-transfer, `F` unspent throughout, carol exits to her own key),
 `sdk17` (multi-hop with a partial second hop), `sdk84` (a leaf that has spent its transfer budget
 gets it back for zero on-chain bytes and no depth).
@@ -343,22 +392,30 @@ conveyance carrying the handover material, and the receiver completing it — ar
 
 ## Depth: what a receiver will adopt
 
-A conveyed child is admitted by `check_exit_headroom_with_margin`
-(`lib/src/transfer/receiver.rs`): the payee's exit walk must fit inside the epoch it inherits **with**
-`exit_slack_margin` of headroom, not merely by a bare latency comparison. The build side runs the
-same rule (`enforce_split_depth_cap_shaped`, `clients/libs/rust/src/tesr.rs`), because a builder
-using the looser rule mints children no receiver can adopt — after terminalizing the parent, so each
-one is a stranded piece.
+A conveyed child is admitted by `enforce_exit_chain_length` (`clients/libs/rust/src/tesr.rs`), which
+counts the **transactions** in the payee's exit walk and refuses above `max_exit_txs` — and that
+ceiling is itself derived from the latency arithmetic, `max_split_depth` searching the deepest chain
+whose `exit_wait_blocks + exit_slack_margin` still fits inside the FIXED exit window `initlock`. Both
+terms are the **receiver's**: `cap_schedule` runs first and binds the conveyed `TesrParams` to the
+receiver's own preset, and the window comes from `/info/config`'s `initlock`. The build side runs the
+same rule (`enforce_split_depth_cap_shaped`, same file, also at `epoch_blocks = initlock`), because a
+builder using a looser rule mints children no receiver can adopt — after terminalizing the parent, so
+each one is a stranded piece.
 
-The cap is **derived, not a literal** (`max_split_depth`): it moves with the network profile. On
-mainnet it is depth **8**, 19 transactions to walk; on regtest depth 54, 111 transactions. The window
-is measured against the parent's **own conveyed backup chain**, never a freshly-read epoch — a
-wallet holding a conveyed child has never held the root, so a local lookup finds nothing. `sdk82`
-drives the gate against a live SE.
+The cap is **derived, not a literal** (`max_split_depth`, `lib/src/transfer/receiver.rs`): it moves
+with the network profile. On mainnet it is depth **8**, 19 transactions to walk; on regtest depth 54,
+111 transactions. The window is a constant, not a calendar: a laddered coin has no epoch deadline
+and no conveyed backup chain to read one from (2026-09-06), so the exit-headroom gate that used to
+measure `epoch_expiry − tip` — `check_exit_headroom_with_margin` — has no production caller; it
+survives only as the arithmetic the cap's own unit tests measure against. `sdk82`, which
+drove that gate, is re-derived (a child has no epoch to run out of), pending run; `sdk17` exercises a
+depth-2 chain under the cap.
 
 ## Maintenance folded into a transfer
 
-Long-lived coins need upkeep, and all of the off-chain kinds run unattended inside `transfer()`:
+Long-lived coins need upkeep. The off-chain kinds are library calls in `mercuryrustlib::tesr`
+(`renew` / `renew_auto`, `rollover` / `rollover_auto`) that the SDK's `transfer()` does **not** yet
+invoke — renewal is by hand today (SPEC.md §0.4):
 
 - **Renewal** replaces the extension horizontally with a lower-CSV one and resets the state ladder.
   `mercuryrustlib::tesr::renew` is exactly two `cosign_tier` calls over the ordinary
@@ -367,12 +424,14 @@ Long-lived coins need upkeep, and all of the off-chain kinds run unattended insi
 - **Rollover** at `m_max = 15` converts the current state into a 1-in-1-out self-split whose child
   output hosts fresh extension and state tiers — a fresh hop budget for +1 depth level and zero
   on-chain bytes.
-- **Auto-refresh before spend.** `transfer()` calls `auto_refresh_before_spend` first, re-anchoring
-  any coin near its **flat** ladder floor before coin selection, so a payment never hands the
-  receiver a coin with no calendar left.
+- **Auto-refresh before spend** is inert. `transfer()` still calls `auto_refresh_before_spend`
+  first, but its due-predicate reads `coin.locktime`, which is `None` for every laddered coin, so it
+  selects nothing: there is no flat-ladder floor and no calendar for a payment to hand over
+  (2026-09-06).
 
-`sdk43` drives renew → rollover → renew past epoch exhaustion and then exits through the whole deep
-chain with `F` untouched. `sdk44` pins the schedule arithmetic.
+`sdk43` drives renew → rollover → renew past extension-budget exhaustion through those library calls
+and then exits through the whole deep chain with `F` untouched. `sdk44` pins the schedule arithmetic
+(re-derived, pending run).
 
 ## Token transfers
 
@@ -384,20 +443,23 @@ stating a bool (`TesrParams::attestation_identity_const(network).is_some()`,
 ladder and the payment is a coloured **in-ladder** split conveying a coloured child (shape `4`). The
 RGB consignment travels in the transfer message and the receiving wallet validates it client-side.
 
-Where none is — mainnet, testnet and signet, because no enclave is provisioned there yet — the
-carrier is not laddered, and the legacy flat coloured split is what would build. Note what it no
-longer *clears*, because it is the same retirement as above seen from the token side: that split's
-piece is a sub-coin over un-broadcast funding, so its conveyance goes through
-`assert_flat_conveyance_is_legitimate`, and the two licences that covered exactly this pair — an RGB
-carrier, and a sub-coin whose `F` is not on chain — are the two that were retired. That function
-holds a single `Ok`, reachable only from a proven licence, so the send refuses **before** the
-conveyance rather than degrading to a censusless lane. Those networks are waiting on an enclave, not
-on a flag.
+Where none is — mainnet and the public testnets, because no enclave is provisioned there yet —
+nothing is laddered at all on the SDK lane, carrier or not (`AttestationIdentityUnpinned`), and
+nothing builds: the legacy flat coloured split dies at `register_split_subcoins_n`, which refuses by
+name (2026-09-06), and the flat conveyance lane with its licence classifier
+(`assert_flat_conveyance_is_legitimate`) is deleted, so the send refuses **before** anything moves
+rather than degrading to a censusless lane. Such a carrier has no exit material until it is coloured
+(TRUST-MODEL B12) and is recoverable only by cooperative withdrawal, which destroys the allocation
+unless the asset is moved off it first. Those networks are waiting on an enclave, not on a flag.
 
-When no single carrier holds the amount, `colored_combine_transfer` spends N carriers of one asset
-into an exact piece plus change in a single SE-co-signed colored combine (N inputs → 2 outputs);
-every combined carrier is made terminal first, and the receiver requires **all N** to be terminal.
-`batch_transfer_tokens` is the fan-out form. See [tokens](tokens.md).
+When no single carrier holds the amount, the payment is **refused**. `colored_combine_transfer` used
+to spend N carriers of one asset into an exact piece plus change in a single SE-co-signed coloured
+combine, but that lane spent each carrier's funding output `F` and exited its outputs through flat
+backups: with the flat chain gone its outputs would have no exit material, so both its caller and its
+own body now run `refuse_legacy_colored_split_lane` — which refuses unconditionally — and its
+registration step `register_combine_subcoins` refuses by name as well (2026-09-06). `sdk31` drove
+that lane and has not been re-derived. `batch_transfer_tokens` is the fan-out form, over a single
+carrier. See [tokens](tokens.md).
 
 ## What a payment costs
 

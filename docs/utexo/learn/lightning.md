@@ -5,16 +5,31 @@ whose claim is held until a SHA256 preimage lands, and that same preimage settle
 Both directions, both amount shapes, running over the pinned `rgb-lightning-node` `pr-90` (LDK 0.2.2)
 fork. No new cryptographic primitive.
 
-Both directions run **on the TES-R ladder**. `claim()` ladders every fresh confirmed root coin, and
-Lightning pays and receives out of those laddered coins — an exact-amount coin is latched whole, any
-other amount goes through an in-ladder split. There is no separate Lightning lane and no protocol
-flag to choose. One configuration caveat is load-bearing here: laddering needs a **pinned enclave
-attestation identity**. `TesrParams::attestation_identity_const` pins regtest's, and returns `None`
-for mainnet, testnet and signet, where no enclave is provisioned — so on those networks an embedder
-that sets neither `SdkConfig::attestation_identity` nor `UTEXO_ATTESTATION_IDENTITY` gets flat coins,
-and a coin travelling flat is not payable over Lightning at all (see the census below).
-[`../spec/SPEC.md`](../spec/SPEC.md) §0.4 row V-6 registers it. The normative account of the latch is
-[`../spec/LIGHTNING.md`](../spec/LIGHTNING.md).
+Both directions run **on the TES-R ladder**. The SDK's `claim()` establish pass ladders every root
+coin it finds un-laddered at **first sight** — `IN_MEMPOOL`, `UNCONFIRMED` or `CONFIRMED`, plain or
+coloured — and Lightning pays and receives out of those laddered coins: an exact-amount coin is
+latched whole, any other amount goes through an in-ladder split. There is no separate Lightning lane
+and no protocol flag to choose.
+
+One configuration fact is load-bearing here, and it is sharper than it used to be, because a coin's
+ladder is now its **only** exit material. Laddering through the SDK needs an enclave attestation
+identity the client can resolve: `TesrParams::attestation_identity_const` pins regtest's (from the
+dev seed this repository commits) and returns `None` for **mainnet and for every public testnet**
+(`testnet`, `testnet3`, `testnet4`, `signet`), where no enclave is provisioned. The SDK's establish
+pass calls `get_statechain_info` — it needs the coordinator's aggregate to bind the ladder against —
+and that call resolves the identity pin → configured value → **refuse**. So on an unpinned network an
+embedder that sets neither `SdkConfig::attestation_identity` nor `UTEXO_ATTESTATION_IDENTITY` gets a
+pass that ladders **nothing**, records `LadderSkipReason::AttestationIdentityUnpinned` for a plain
+coin (`RgbCarrier` for a carrier, whose arm runs before that call), and leaves
+every deposit booked but with **no exit material at all**: it cannot be conveyed (so it is neither
+payable nor receivable over Lightning — there is no census to run on it) and it cannot be
+unilaterally exited. **Cooperative withdrawal is the only route out.** That is a not-yet-deployable
+state rather than a live regression: mainnet has no enclave provisioned in the first place, so no
+wallet is running there today. (The lane distinction matters — `mercuryrustlib`'s own
+`update_coins` / `LadderAtSight::Plain` path ladders inside the deposit pass through
+`tesr::establish_auto`, which calls no attested endpoint and so needs no pin. It is the SDK path,
+the one a wallet user takes, that stops.) [`../spec/SPEC.md`](../spec/SPEC.md) §0.4 row V-6 registers
+it. The normative account of the latch is [`../spec/LIGHTNING.md`](../spec/LIGHTNING.md).
 
 ## The latch
 
@@ -154,31 +169,43 @@ PAY is where the trust actually sits, because the Lightning leg is irreversible.
    appear in `peek_pending_transfers`, which only returns transfers this wallet can **decrypt with
    its own auth key** — so membership is proof of address, not a claim.
 3. **Ladder census.** Each pending entry carries `ladder_census_ok`, computed by
-   `peek_pending_transfers` itself. There is no shape that passes trivially. `protocol_version` is an
-   exact-set **shape selector**, not an ordinal (`ADMISSIBLE_PROTOCOL_VERSIONS = [0, 2, 4]`,
-   enforced by `admissible_shape`), and the census dispatches on it:
+   `peek_pending_transfers` itself. There is no shape that passes trivially. The peek picks its lane
+   from the **material actually conveyed** — a message carrying a `child_tesr_bundle` goes to the
+   child census, everything else to the root one — and then each census **self-guards its own
+   shape**: `protocol_version` is an exact-set selector, not an ordinal
+   (`ADMISSIBLE_PROTOCOL_VERSIONS = [2, 4]` since 2026-09-06, enforced by `admissible_shape`), and
+   each arm additionally requires exact equality with the one version it accepts, so a
+   sender-declared version can only ever refuse a payment, never redirect it:
    * **2**, a root-ladder conveyance → `prepay_flat_census`, whose every step returns `Err` and whose
      only caller maps `Err` to `ladder_census_ok = false`; there is no success path that skips a
-     check. Four bindings, all required: the funding output must have been read **from the chain**
-     (a branch-supplied, un-broadcast `tx0` is sender-controlled and binds nothing);
-     `verify_flat_backup_lane`, so a coloured backup a prior owner still holds over `F` cannot be
-     conveyed as a flat one; the owner-exit binding (`bundle.owner_exit_address == my_backup`), so a
-     perfectly coin-bound ladder that pays a third party on exit cannot take the SSP's Lightning
-     money; and `verify_bundle_bound`, which pairs the coin binding — statechain id, funding
-     outpoint, on-chain value, the on-chain aggregate scriptPubKey, and the coordinator's recorded
-     `se_aggregate_pubkey` for that sid (absent ⟹ reject) — with the exact-equality count
-     `num_sigs == flat_backups + tiers + disclosed superseded` against the
-     **enclave-authoritative** sig-count, so a hidden lower-CSV `S*` inflates the count and the
-     census fails, and a self-signed decoy ladder over an attacker-controlled outpoint cannot pass
-     by being merely self-consistent.
+     check. Five bindings, all required: the funding output must have been read **from the chain**,
+     unspent and confirmed (a branch-supplied, un-broadcast `tx0` is sender-controlled and binds
+     nothing); `verify_flat_backup_lane`, which refuses a ladder conveyed with **any** flat backup
+     transaction beside it, plain or coloured, because none exists to convey and a retained one is a
+     spend of `F` the census cannot account for; `refuse_branch_material`, which refuses conveyed
+     `branch_txs` or `terminal_parents` for the same reason; the owner-exit binding
+     (`bundle.owner_exit_address == my_backup`), so a perfectly coin-bound ladder that pays a third
+     party on exit cannot take the SSP's Lightning money; and `verify_bundle_bound`, which pairs the
+     coin binding — statechain id, funding outpoint, on-chain value, the on-chain aggregate
+     scriptPubKey, and the coordinator's recorded `se_aggregate_pubkey` for that sid (absent ⟹
+     reject) — with the exact-equality count `num_sigs == tiers + disclosed superseded` against the
+     **enclave-authoritative** sig-count. The count has exactly **two** categories: the flat term is
+     zero by construction (`PARENT_V2_BASELINE = 0`, `CHILD_V2_BASELINE = 0`) and a conveyed flat
+     backup is refused by name before the count is taken. So a hidden lower-CSV `S*` inflates the
+     count and the census fails, and a self-signed decoy ladder over an attacker-controlled outpoint
+     cannot pass by being merely self-consistent.
    * **4**, a child conveyance → `verify_conveyed_child`, bound to the *latched* sid, not already
      adopted, over a live on-chain parent root. Its census-bound exit value — never a
      sender-declared field — is what the value gate then prices against.
-   * **0**, the flat branch + backup-chain lane, and anything outside the set → refused. A coin
-     travelling flat is **not payable over Lightning**, and that is intended, not an omission: there
-     is no census to run on it. With the plain un-laddered shape retired that population is now the
-     residue — legacy coins, and carriers on a network with no enclave attestation identity pinned —
-     rather than a lane the product mints into.
+   * anything outside `{2, 4}` → refused. The un-laddered shape **0** (branch + backup chain) no
+     longer exists and cannot be received (`ADMISSIBLE_PROTOCOL_VERSIONS = [2, 4]`, 2026-09-06): a
+     coin with no ladder has no exit material and no conveyance at all, so it is **not payable over
+     Lightning** — there is no census to run on it. That population is a fault to repair (a recorded
+     `LadderSkipReason`: `RgbCarrier` for a carrier the coloured builder could not take,
+     `AttestationIdentityUnpinned` for a plain coin on a network with no enclave identity pinned),
+     not a lane the product mints into. Nothing licences conveying such a coin instead:
+     `is_legitimate_flat_reason` returns `false` for every reason and `permits_flat_conveyance` is
+     never true — the records are diagnostic only.
 
    A refusal carries `ladder_census_refusal`, the sentence naming *which* check refused, so an
    operator is not handed a six-way disjunction.
@@ -187,6 +214,18 @@ PAY is where the trust actually sits, because the Lightning leg is irreversible.
    amount the consignment **cryptographically assigns** to the coin — never the attacker-controlled
    envelope hint — and both a wrong asset and an undersized one are refused while the Lightning money
    is still the SSP's. A post-claim balance-delta check remains as a backstop.
+
+   **This arm only started working on 2026-09-06, and the change is worth naming.** The RGB material
+   used to ride on a backup row, and no conveyance writes one any more, so `peek_pending_transfers`
+   reported `rgb_consignment: None` for every laddered coin and `execute_pay` refused **every** RGB
+   invoice at the line above. The peek now derives the material from the coin's own **bundle**: a
+   coloured ROOT ladder's or coloured CHILD's **leaf consignment**, wrapped as the SDK's
+   `{"c","a","s"}` envelope; `rgb_assignment_txid` / `rgb_assignment_vout`, the receiver's own
+   final-state payload output — the outpoint the claim path books, not `F`, because on a coloured
+   ladder the allocation sits at the leaf; and `child_witness_txids`, the witness chain the
+   consignment resolves against (a root ladder's `ladder_txids()`, a child's
+   `colored_child_txids()`). A bundle that will not parse, or a plain one, yields nothing — and
+   nothing is what the gate refuses on.
 
 `sdk20` drives the adversarial gate; `sdk37` pins what value it reads — the ladder-committed,
 exit-reachable value, and the pre-payment predicate being the *same shared function* the claim path
@@ -300,21 +339,29 @@ Four boundaries are worth knowing before building on this, and the first one gat
   SSP receives is the piece *child*, conveyed by `convey_child_bundle` at `protocol_version = 4` — so
   the census takes the **4** arm above, `verify_conveyed_child`, which is also the arm the
   `child_witness_txids` requirement below belongs to. The PAY lane is reachable there. Where no
-  identity is pinned — mainnet, testnet and signet, because no enclave is provisioned there yet — the
-  carrier is not laddered and the send now stops on the **sender's** side: with the flat-lane licences
-  retired there is nothing left for `assert_flat_conveyance_is_legitimate` to prove about a carrier,
-  so it refuses before the coin moves. That is the better half of the same closure — the flat carrier
-  used to be conveyed as `protocol_version` **0** and then refused by `prepay_flat_census` at its
-  version floor, i.e. after it had already left the wallet. The gate is enclave provisioning, not a
-  flag someone forgot to set. RECEIVE is the SSP's own coin and does not sit behind it. See
-  [tokens.md](tokens.md).
+  identity is pinned — mainnet and every public testnet, because no enclave is provisioned there yet
+  — `colored_ladder` is false, so the establish pass records `LadderSkipReason::RgbCarrier` for the
+  carrier (the carrier arm runs *before* the attested `get_statechain_info` call, which is where a
+  *plain* coin instead records `AttestationIdentityUnpinned`) and the send stops on the **sender's**
+  side: the flat conveyance lane and its licence classifier
+  (`assert_flat_conveyance_is_legitimate`, `PermanentLicence`) are deleted (2026-09-06),
+  `is_legitimate_flat_reason` answers `false` for every recorded reason, and
+  `transfer_sender::execute` refuses a coin with no ladder row by name before the coin moves. That is
+  the better half of the same closure — the flat carrier used to be conveyed as `protocol_version`
+  **0** and then refused by `prepay_flat_census` at its version floor, i.e. after it had already left
+  the wallet. The gate is enclave provisioning, not a flag someone forgot to set. RECEIVE is the
+  SSP's own coin and does not sit behind it. See [tokens.md](tokens.md).
 * **Non-exact RGB PAY does not exist.** `pay_lightning_invoice_inladder` refuses an asset quote by
   name.
-* **An envelope with nothing to resolve it against is refused, by name.** The pre-pay gate requires
-  either a flat exit branch (`branch_txs`) or a coloured child's own witness chain
-  (`child_witness_txids`) to validate the consignment before paying. With neither, the SSP cannot
-  verify the allocation and a Lightning payment is irreversible, so it refuses rather than resting on
-  an RGB resolver happening to fail. Latch a coloured carrier at the root instead.
+* **An envelope with nothing to resolve it against is refused, by name — and that is now the only
+  reason the RGB gate refuses for want of material.** The pre-pay gate needs a witness chain: either
+  a legacy exit branch (`branch_txs`, non-empty only on a row that predates 2026-09-06) or the
+  coloured coin's own `child_witness_txids`, which `peek_pending_transfers` derives from the
+  conveyed bundle for a coloured ROOT ladder as well as a coloured CHILD. With **neither**, the SSP
+  cannot verify the allocation and a Lightning payment is irreversible, so it refuses rather than
+  resting on an RGB resolver happening to fail. Before that derivation existed the peek surfaced no
+  RGB material for any laddered coin, so this refusal caught *every* RGB invoice; it now catches only
+  a conveyance that genuinely describes no coloured chain.
 * **RGB is local-SSP only, in both directions.** `create_lightning_invoice_asset` takes `&SspService`,
   not `&impl Ssp`. PAY is nominally generic over `impl Ssp`, but the `mercury-ssp` server's `/quote`
   handler emits only `amount_sats` / `fee_sats` / `payment_hash` / `ssp_address` — so an RGB invoice
@@ -322,9 +369,12 @@ Four boundaries are worth knowing before building on this, and the first one gat
   invoice — and `/receive` has no asset variant at all. A remote asset endpoint is a follow-up.
 
 **Status.** `sdk23` drives the Lightning half end to end through `RlnClient` — issue → colored
-channel → asset invoice → decode → pay → balance shift — and `sdk37` part [4] pins the pre-payment
-consignment validation on `validate_pending_token`, the flat-branch form of the same shared
-predicate. A **full cross-rail swap is not built**; it remains a follow-up
+channel → asset invoice → decode → pay → balance shift — and `sdk37` part [4] is re-derived onto the
+coloured lane: a token piece reaches the SSP as a conveyed coloured CHILD, and the test asserts the
+peek surfaces its leaf consignment, its assignment outpoint and its five-tier witness chain, that it
+conveys **no** exit branch, and that `validate_pending_token_ex` over exactly that material books the
+consignment-assigned amount before any claim. Both are **pending a run** against the regtest stack.
+A **full cross-rail swap is not built**; it remains a follow-up
 ([`../spec/LIGHTNING.md`](../spec/LIGHTNING.md) §9 residual 6).
 
 ## Before exposing a public SSP
@@ -372,6 +422,11 @@ operator could otherwise collude. With one SE the preimage simply lives at the S
 unit as the rest of the layer, one fewer moving part.
 
 ---
+
+**Test status, stated once.** The unit and CI-guard suites are green and the E2E crate compiles, but
+**no E2E flow has been re-run against the regtest stack since the flat backup was removed on
+2026-09-06**. Every flow named below is evidence *pending a run*; the measurements attributed to
+individual flows in this document are the ones recorded before that change.
 
 Tests: `sdk63` (PAY exact), `sdk65` (PAY non-exact), `sdk64` (RECEIVE exact), `sdk67` (RECEIVE
 non-exact), `sdk66` (non-exact PAY failure → rollback to the whole parent), `sdk68` (exact PAY
