@@ -2849,7 +2849,7 @@ pub(crate) const BACKUP_TX_VBYTES: u64 = 112;
 /// The minimum VIABLE value for a split sub-coin output at backup feerate `fee_rate_sats_per_byte`:
 /// the P2TR dust floor PLUS the fee the sub-coin's own backup tx must pay. A split output below
 /// this is a valid tx output but a coin that can never be exited — its backup would sweep below
-/// dust (`create_tx1` → `MercuryError::FeeTooLow`, lib/src/transaction.rs). Admitting it and then
+/// dust (the retired `create_tx1` → `MercuryError::FeeTooLow`, lib/src/transaction.rs). Admitting it and then
 /// consuming the parent (spend budget → terminal) strands the parent to unilateral-exit-only.
 /// `fee_rate_sats_per_byte` MUST be the rate `create_tx1` uses = `min(SE quote, max_fee_rate)`.
 pub(crate) fn min_split_output(fee_rate_sats_per_byte: f64) -> u64 {

@@ -479,9 +479,10 @@ impl UtexoWallet {
         self.withdraw(&fresh_addr, Some(vec![statechain_id.to_string()]), Some(rate))
             .await?;
 
-        // 5. The withdraw broadcast IS the fresh deposit's funding tx. The new coin confirms via the
-        //    watcher (fresh ladder via create_tx1 at the new deposit height); the old coin is now
-        //    WITHDRAWING → WITHDRAWN, its outpoint spent and its old backups dead.
+        // 5. The withdraw broadcast IS the fresh deposit's funding tx, so the new coin is laddered
+        //    at FIRST SIGHT of it — the deposit path's own establish pass, before it confirms — and
+        //    the ladder is rooted at the new outpoint. The old coin is now WITHDRAWING → WITHDRAWN
+        //    and every exit right rooted at its outpoint is a double-spend of a spent input.
         let after_wd = self.record().await?;
         let refresh_txid = after_wd
             .coins

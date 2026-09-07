@@ -1,15 +1,23 @@
 //! **[D47] The shape rules that discharge the census's distinctness premise must SAY they do.**
 //!
-//! `se_num_sigs == flat_backups + tiers + superseded` is an exact equality, and it is only sound if
-//! the counted categories are pairwise distinct — no object countable as both a flat backup and a
-//! tier. That premise is discharged by SHAPE: a flat backup is nVersion 2 / nSequence 0 / height
-//! `nLockTime` / one non-`OP_RETURN` output; a tier is nVersion 3 / `nLockTime` 0 / one 240-sat
-//! anchor / CSV in band. Nothing satisfies both.
+//! `se_num_sigs == tiers + superseded` is an exact equality, and it is only sound if the counted
+//! categories are pairwise distinct — no object countable in two slots at once.
 //!
-//! Every one of those rules exists for a TRANSPORT reason — relay, the race, TRUC. So the failure
-//! mode is not that someone attacks the census; it is that someone relaxes a shape rule for a
-//! perfectly good relay-side reason, the categories stop being distinguishable, and the census
-//! silently starts counting one thing as another.
+//! **The flat term is now zero by construction, and that CHANGED which half of the argument is
+//! load-bearing.** A flat backup is no longer a category the census counts against a tier: no coin
+//! carries one, and a conveyed `backup_transactions` / `parent_flat_backups` vector is refused
+//! WITHOUT BEING READ (`verify_flat_backup_lane`, `refuse_conveyed_flat_backups`). So the
+//! flat-versus-tier shape separation — a flat backup being nVersion 2 / nSequence 0 / height
+//! `nLockTime` / one non-`OP_RETURN` output, a tier being nVersion 3 / `nLockTime` 0 / one 240-sat
+//! anchor / CSV in band — discharges the premise by REFUSAL rather than by discrimination, and what
+//! now separates the two LIVE categories (a live tier and a disclosed superseded tier, which are
+//! both tier-shaped) is SLOT UNIQUENESS: every tier is keyed by its txid and one txid may occupy
+//! exactly one census slot.
+//!
+//! Every one of those shape rules still exists for a TRANSPORT reason — relay, the race, TRUC. So
+//! the failure mode is not that someone attacks the census; it is that someone relaxes a shape rule
+//! for a perfectly good relay-side reason, a refused shape becomes admissible or two tiers become
+//! confusable, and the census silently starts counting one thing as another.
 //!
 //! D47 discharges the premise by SAYING SO where the change would happen, rather than by adding a
 //! runtime check that re-derives a structurally true property at every claim. This guard is what
@@ -64,6 +72,29 @@ fn the_shape_rules_are_stated_to_carry_a_census_obligation() {
              cannot be re-checked when one of them changes."
         );
     }
+}
+
+/// **THE HALF THAT IS NOW LOAD-BEARING.** With the flat term pinned to zero, the two categories the
+/// census actually counts — a live tier and a disclosed superseded tier — are BOTH tier-shaped, so
+/// no shape rule separates them. What does is slot uniqueness over their union. If the spec ever
+/// stops saying that, the premise is undischarged for the only pair that still needs it, and the
+/// shape rules above would be guarding a category that is refused rather than counted.
+#[test]
+fn slot_uniqueness_is_stated_for_the_two_live_categories() {
+    let spec = read("docs/utexo/spec/SPEC.md");
+    let lower = spec.to_lowercase();
+    assert!(
+        lower.contains("slot uniqueness"),
+        "SPEC.md no longer states SLOT UNIQUENESS. With the flat term zero by construction it is \
+         the ONLY thing separating a live tier from a disclosed superseded one — both are \
+         tier-shaped, so the nVersion/nSequence/nLockTime rules do not tell them apart."
+    );
+    assert!(
+        lower.contains("zero by construction"),
+        "SPEC.md no longer says the flat term is ZERO BY CONSTRUCTION. Without it a reader cannot \
+         tell whether the shape rules below discharge a live distinctness obligation or guard a \
+         category that is refused unread."
+    );
 }
 
 /// THE REJECTED ALTERNATIVE stays rejected, in writing. A runtime distinctness check is the obvious

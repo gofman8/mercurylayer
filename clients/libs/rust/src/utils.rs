@@ -28,23 +28,26 @@ pub async fn info_config(client_config: &ClientConfig) -> Result<InfoConfig>{
 
     // [D8(f)] THE COORDINATOR'S COPY IS A CROSS-CHECK, NOT THE SOURCE.
     //
-    // `interval` is what INV-5 measures every flat-backup hop against, and that check is the defence
-    // against a sender padding the backup vector to inflate `flat_backups` and absorb a hidden
-    // co-signed state. Taking it from the coordinator let the coordinator define the defence.
+    // These two used to govern INV-5, the rule that each flat backup decrements by exactly
+    // `interval` — the defence against a sender padding the backup vector to hide a co-signed
+    // state. That lane is retired: no flat backup is ever built, and a conveyed vector is refused
+    // without being read, so `interval` is now applied to nothing and survives as a compatibility
+    // constant.
     //
-    // Deriving it from the conveyed chain instead would be circular — a padded chain with uniform
-    // `I/2` decrements derives `I/2` and validates against itself — so the value is compiled in per
-    // network, and what the coordinator says must MATCH or the call is refused by name. A mismatch is
-    // not something to paper over: it means this client and that coordinator disagree about what a
-    // valid ladder is, and proceeding would validate against the wrong yardstick.
+    // `initlock` is NOT vestigial. It is the FIXED window the split-depth cap measures a child's
+    // exit chain against (`tesr::enforce_split_depth_cap`), so a coordinator that could choose it
+    // could choose how deep a payment tree this wallet will adopt. That is why both are still
+    // compiled in per network and the coordinator's copy must MATCH or the call is refused by name:
+    // a mismatch means this client and that coordinator disagree about what a valid coin is, and
+    // proceeding would validate against the wrong yardstick.
     let network = client_config.network.to_string();
     let (initlock, interval) = match mercurylib::tesr::TesrParams::flat_ladder_params(&network) {
         Some(p) => p,
         None => {
             return Err(anyhow!(
-                "unknown network {:?}: refusing to guess the flat-ladder parameters. `interval` is \
-                 what INV-5 measures every backup hop against, so a wrong value silently changes \
-                 which ladders this wallet accepts.",
+                "unknown network {:?}: refusing to guess the ladder parameters. `initlock` is the \
+                 fixed window the split-depth cap measures a child's exit chain against, so a wrong \
+                 value silently changes which payment trees this wallet adopts.",
                 network
             ));
         }
@@ -52,10 +55,11 @@ pub async fn info_config(client_config: &ClientConfig) -> Result<InfoConfig>{
     if server_config.initlock != initlock || server_config.interval != interval {
         return Err(anyhow!(
             "the coordinator reports initlock={} interval={} but this client compiles in \
-             initlock={} interval={} for network {:?}. These govern INV-5 — the rule that each flat \
-             backup decrements by EXACTLY `interval`, which is what stops a sender padding the chain \
-             to hide a co-signed state — so they cannot be taken on the coordinator's word, and a \
-             disagreement means one of us is validating against the wrong ladder. Refusing.",
+             initlock={} interval={} for network {:?}. `initlock` is the fixed window the \
+             split-depth cap measures a child's exit chain against (`interval` is retired with the \
+             flat backup chain and kept only for compatibility), so it cannot be taken on the \
+             coordinator's word, and a disagreement means one of us is validating against the wrong \
+             ladder. Refusing.",
             server_config.initlock, server_config.interval, initlock, interval, network
         ));
     }

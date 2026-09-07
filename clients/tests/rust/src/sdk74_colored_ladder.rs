@@ -1321,13 +1321,37 @@ pub async fn execute() -> Result<()> {
         }
         Err(e) => format!("{e:#}"),
     };
+    let lower = refusal.to_lowercase();
     assert!(
-        refusal.contains("retired"),
-        "the opted-out payment must be refused BY NAME as the retired branch split, got: {refusal}"
+        lower.contains("retired"),
+        "the opted-out payment must be refused BY NAME as the retired coloured-split lane, got: {refusal}"
     );
+    assert!(
+        lower.contains("flat backups") || lower.contains("exit material"),
+        "the refusal must say WHY the lane is retired — its sub-coins were exited by flat backups, \
+         which no longer exist — so the reader is not left thinking a flag would re-open it: {refusal}"
+    );
+    // **AND THE REFUSAL COSTS NOTHING.** The gate fires BEFORE `create_colored_split_tx`, so no
+    // co-signature is spent on a payment that cannot complete. This used to run the other way
+    // round: the carrier was co-signed once (num_sigs 0 -> 1) and a structural-spend journal entry
+    // written, and only then did `register_split_subcoins` refuse — leaving the carrier's census
+    // one signature heavier than its disclosed material for good, which is precisely the shape a
+    // receiver refuses a coin over.
+    for sid in &carol_carriers {
+        assert_eq!(
+            mercuryrustlib::utils::get_statechain_info(sid, &cc)
+                .await?
+                .ok_or(anyhow!("no statechain info for carol's carrier {sid}"))?
+                .num_sigs,
+            0,
+            "the retired lane must refuse BEFORE any SE co-sign: carol's carrier {sid} still has \
+             num_sigs 0 after the refused payment, so nothing was spent on a lane that cannot deliver"
+        );
+    }
     println!(
         "SDK74 - opting out yields no second lane: carol's carrier has no ladder, 0 flat rows, \
-         num_sigs 0, is recorded rgb-carrier, and paying from it is refused ({})",
+         num_sigs 0 BEFORE AND AFTER the refused payment, is recorded rgb-carrier, and paying from \
+         it is refused ({})",
         refusal.lines().next().unwrap_or("").trim()
     );
 

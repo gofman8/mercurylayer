@@ -97,8 +97,12 @@ fn split_bounds_exact_boundary() {
     assert!(split_amounts(630, DUST_LIMIT).is_err(), "330 + 300 == 630: no room for change");
 }
 
-// GRN-INV-1b: the 330-sat DUST floor is NOT the minimum *mintable* piece. Each sub-coin also needs
-// a valid backup, and `create_tx1` sweeps `piece − ceil(BACKUP_VB·fee_rate)` and rejects it below
+// GRN-INV-1b: the 330-sat DUST floor is NOT the minimum *mintable* piece. (RETIRED SHAPE, kept for
+// the floor arithmetic: this reasons about the off-chain BRANCH split, whose sub-coins were exited
+// by flat backups. That lane is retired — `register_split_subcoins_n` refuses by name — and a piece
+// is now carved by the in-ladder split, which funds each child's own two tiers instead. The floor
+// below is still the right shape of bound, sized against different transactions.)
+// Each sub-coin also needed a valid backup, and `create_tx1` swept `piece − ceil(BACKUP_VB·fee_rate)`, rejecting it below
 // the dust floor (FeeTooLow, lib/src/transaction.rs:122-132). So the true minimum mintable piece is
 // `330 + ceil(112·rate)` — 442 sats at 1 sat/vB (measured by sdk28). The signing path enforces this
 // via `split_amounts_floored(parent, piece, min_split_output(fee_rate))` BEFORE the parent is made

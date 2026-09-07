@@ -71,7 +71,12 @@ run() {
   local elapsed=$(( $(date +%s) - start ))
   snapshot_docker "$log" "$((elapsed + 5))"
   local ok="FAIL(rc=$rc)"
-  if [ $rc -eq 0 ] && grep -qE "SUCCESS|completed successfully|Result as reported" "$log"; then ok="PASS"; fi
+  # A flow reports success in its own words. `rc -eq 0` is the load-bearing half — a failed
+  # assertion panics and exits non-zero — and this pattern only decides the LABEL. It has to
+  # recognise "PASS" too: the flows re-derived for the ladder-at-first-sight rule end on
+  # "SDK71 - PASS: ..." / "SDK48 - \u2713 PASS: ...", and reading those as FAIL made three green runs
+  # look like three regressions.
+  if [ $rc -eq 0 ] && grep -qE "SUCCESS|completed successfully|Result as reported|✓ PASS|- PASS:|^[a-z0-9_]+: OK$" "$log"; then ok="PASS"; fi
   printf "%-14s -> %-14s (%ss)\n" "$label" "$ok" "$elapsed" | tee -a "$SUMMARY"
 }
 

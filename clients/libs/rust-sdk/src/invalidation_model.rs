@@ -1,6 +1,17 @@
 //! Executable model of the old-state invalidation mechanism — the executable companion of
 //! INVALIDATION-SPEC (retired 2026-08-15).
 //!
+//! ⚠️ **THIS MODELS A RETIRED SHAPE, 2026-09-06.** The flat backup chain it computes — `tx1` at
+//! `h + initlock`, each hop decrementing by `interval`, a deposit-anchored deadline `min(L_k)` — no
+//! longer exists in the protocol. No coin carries a flat backup or an absolute locktime; a coin's
+//! only exit material is its TES-R ladder, and old state is invalidated by per-hop supersession at
+//! a strictly lower CSV instead. These tests are kept because they still pin the arithmetic of the
+//! functions that survive for OTHER reasons (`calculate_block_height` still sizes a cooperative
+//! WITHDRAWAL's locktime; `tesr_exit_*` are live production model), and because a model of what was
+//! replaced is what lets a reader check the replacement is not worse. Nothing here describes
+//! current behaviour: do not cite it as such, and do not restore a caller for the flat arithmetic
+//! on the strength of it.
+//!
 //! Pure logic only: no network, no DB, no running stack. Wherever a callable pure function
 //! exists these tests call the REAL one:
 //!

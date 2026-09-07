@@ -358,9 +358,16 @@ pub const AUTO_EXIT_MODELLED_DEPTH: u32 = 1;
 /// **The derived `auto_exit_margin_blocks` default. [P0-5]**
 ///
 /// ```text
-/// margin = k_max · interval          the audit-[17] gap the deposit-anchored deadline misses
+/// margin = k_max · interval          RETIRED TERM — see below
 ///        + tesr_exit_txs(d) · 144    one confirmation window per SEQUENTIAL tx of the exit walk
 /// ```
+///
+/// ⚠️ **The first term sizes a defence with no subject, and the whole constant configures a pass
+/// with none.** `k_max · interval` measured the gap a prior owner's flat backup chain opened; that
+/// chain is retired, no coin carries an absolute deadline, and `auto_exit_due` — the only consumer
+/// — finds nothing due. The arithmetic is kept UNCHANGED rather than zeroed so that the margin is
+/// still correctly sized on the day a height-keyed deadline exists again; zeroing it would leave a
+/// future pass with a silent one-confirmation budget for a multi-transaction walk.
 ///
 /// The second term is the correction. The literal it replaces spent a single `+ 144` — a budget for
 /// ONE transaction — on a walk that lands `3 + 2d` of them one after another, each of which must
