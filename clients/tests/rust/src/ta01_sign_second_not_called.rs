@@ -106,7 +106,7 @@ pub async fn execute_only_sign_first(
 
 async fn ta01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
 
-    let amount = 1000;
+    let amount = 10000;
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 

@@ -61,7 +61,7 @@ fn refusal_of(client_config: &ClientConfig, signed_tx: &str) -> Option<String> {
 
 pub async fn old_state_broadcasted(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
 
-    let amount = 1000;
+    let amount = 10000;
 
     // Create first deposit address
 

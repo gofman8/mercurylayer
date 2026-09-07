@@ -143,6 +143,26 @@ pub fn tier_out_value(prev_value: u64, fee_rate_sats_per_vb: f64) -> Option<u64>
         .and_then(|cost| prev_value.checked_sub(cost))
 }
 
+/// **The smallest funding value that can carry a WHOLE ladder — and it must be checked BEFORE the
+/// first co-signature.**
+///
+/// [`establish`] interleaves building and co-signing: it builds `T`, co-signs it, builds `X_0`,
+/// co-signs it, builds `S_0`, co-signs it. So a funding output large enough for `T` but not for the
+/// tiers beneath it does not fail cleanly — it burns one or two IRREVERSIBLE SE co-signatures and
+/// then dies with [`MercuryError::FeeTooHigh`], leaving the coin's `num_sigs` permanently ahead of
+/// any bundle that can be persisted. That is a coin whose census no receiver can ever balance, and
+/// since laddering happens at first sight of the deposit, the coin is not booked either: the value
+/// is on chain, un-laddered, unconveyable and invisible.
+///
+/// This is the plain-lane twin of [`crate::tesr`]'s coloured floor (`colored_ladder_floor` in
+/// `mercuryrustlib`), which exists for exactly this reason and says so. Three rungs, each burning
+/// `committed_fee(rate) + P2A_VALUE`, plus a final state output that still clears dust.
+///
+/// At the shipped rate of 3 sat/vB this is `3 · (375 + 240) + 330` = **2 175 sat**.
+pub fn ladder_floor(fee_rate_sats_per_vb: f64, dust_limit: u64) -> u64 {
+    3 * (committed_fee(fee_rate_sats_per_vb) + P2A_VALUE) + dust_limit
+}
+
 /// The smallest value an in-ladder split CHILD can carry and still be exitable.
 ///
 /// A child of an in-ladder split is not a bare output: `establish_child` hangs the child's OWN
@@ -2423,5 +2443,68 @@ mod req83_85_tail_rule {
         // tier look like a tail carrier and the cap would fire on honest transactions.
         let outs = vec![(DUST_LIMIT, p2tr()), (P2A_VALUE, anchor()), (0, opret())];
         assert_eq!(tail_verdict(&outs, Some(P2A_VALUE)), TailVerdict::NoTail);
+    }
+}
+
+/// **The whole-ladder funding floor, and the interleaving it protects against.**
+///
+/// `establish` builds and co-signs tier by tier, so a coin that clears the FIRST rung but not the
+/// third does not fail cleanly — it burns irreversible co-signatures and then dies. These pin the
+/// arithmetic and, more importantly, the ORDERING claim the floor rests on.
+#[cfg(test)]
+mod ladder_floor_tests {
+    use super::*;
+
+    /// The shipped number, written out. If a constant moves, this says so rather than letting the
+    /// deposit guard and the builder drift apart silently.
+    #[test]
+    fn the_floor_is_three_rungs_plus_dust() {
+        let rate = TesrParams::mainnet().committed_fee_rate;
+        assert_eq!(rate, 3.0, "the shipped committed fee rate");
+        assert_eq!(committed_fee(rate), 375, "125 vB at 3 sat/vB");
+        assert_eq!(
+            ladder_floor(rate, DUST_LIMIT),
+            3 * (375 + P2A_VALUE) + DUST_LIMIT,
+            "three rungs, each a committed fee plus the anchor, then a spendable state output"
+        );
+        assert_eq!(ladder_floor(rate, DUST_LIMIT), 2_175);
+    }
+
+    /// **THE PROPERTY THE FLOOR EXISTS FOR.** A value at or above the floor carries all three tiers
+    /// with the last output still spendable; one below it fails at some rung — and `establish` has
+    /// already co-signed every rung before that one. The floor must therefore be the value at which
+    /// the WHOLE walk succeeds, not the value at which the first tier does.
+    #[test]
+    fn below_the_floor_a_later_rung_fails_after_earlier_ones_would_be_signed() {
+        let rate = TesrParams::mainnet().committed_fee_rate;
+        let floor = ladder_floor(rate, DUST_LIMIT);
+
+        let walk = |f_value: u64| -> Option<u64> {
+            let t = tier_out_value(f_value, rate)?;
+            let x = tier_out_value(t, rate)?;
+            tier_out_value(x, rate)
+        };
+
+        let at = walk(floor).expect("a coin at the floor completes all three rungs");
+        assert!(at >= DUST_LIMIT, "and its final state output is spendable: {at}");
+
+        // One satoshi below the floor the walk still completes but the final output is dust —
+        // unbroadcastable, so the ladder is not exit material.
+        let below = walk(floor - 1).expect("value arithmetic still resolves just below the floor");
+        assert!(below < DUST_LIMIT, "just below the floor the state output is dust: {below}");
+
+        // Far below, a LATER rung underflows outright. The first rung still succeeds, which is
+        // exactly the trap: `establish` would have co-signed it before finding out.
+        let small = 1_000;
+        assert!(small < floor);
+        assert!(
+            tier_out_value(small, rate).is_some(),
+            "the trigger alone fits in {small} sat — the first co-signature would be spent"
+        );
+        assert!(
+            walk(small).is_none(),
+            "but the walk cannot finish, so a pre-flight floor is the only way to refuse before \
+             burning that signature"
+        );
     }
 }

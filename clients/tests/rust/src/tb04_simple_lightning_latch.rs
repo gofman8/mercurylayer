@@ -8,7 +8,7 @@ use sha2::{Sha256, Digest};
 
 pub async fn tb04(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
 
-    let amount = 1000;
+    let amount = 10000;
 
     // Create first deposit address
 

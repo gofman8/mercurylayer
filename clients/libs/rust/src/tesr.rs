@@ -1762,6 +1762,29 @@ pub async fn establish(
     let f_value = coin.amount.ok_or_else(|| anyhow::anyhow!("no amount"))? as u64;
     let agg = coin.aggregated_address.clone().ok_or_else(|| anyhow::anyhow!("no aggregated_address"))?;
 
+    // ═══ PRE-FLIGHT: CAN THIS COIN CARRY A WHOLE LADDER? ═══
+    //
+    // Checked HERE, before the first co-signature, and not left to `build_extension` to discover.
+    // The build and the co-sign below are interleaved, so a coin big enough for `T` but not for the
+    // tiers under it would burn one or two IRREVERSIBLE co-signs and then fail: `num_sigs` would sit
+    // permanently ahead of any bundle that can be persisted, which is a coin whose census no
+    // receiver can ever balance. And because the ladder is established at FIRST SIGHT of the
+    // deposit, such a coin is not booked either — its value would be on chain, un-laddered,
+    // unconveyable and invisible to its owner. The coloured lane has had this gate, and the same
+    // reasoning, since CTES-R; the plain lane needed it the moment laddering moved to deposit time.
+    let floor = mercurylib::tesr::ladder_floor(fee_rate, mercurylib::tesr::DUST_LIMIT);
+    if f_value < floor {
+        return Err(anyhow::anyhow!(
+            "funding output {f_txid}:{f_vout} holds {f_value} sat, below the {floor} sat a TES-R \
+             ladder costs at {fee_rate} sat/vB (three tiers, each burning a committed fee plus the \
+             {} sat anchor, and a final state output that still clears the {} sat dust floor). \
+             Refusing BEFORE any co-signature: establishing part of a ladder would raise this \
+             coin's signature count with no bundle to account for it, and no receiver could ever \
+             balance its census. Deposit at least {floor} sat.",
+            mercurylib::tesr::P2A_VALUE,
+            mercurylib::tesr::DUST_LIMIT
+        ));
+    }
     let t = mercurylib::tesr::build_trigger(&f_txid, f_vout, f_value, &agg, network, fee_rate)?;
     let t_signed = cosign_tier(cc, coin, t.tx_hex.clone(), f_value, network).await?;
     let x = mercurylib::tesr::build_extension(&t.txid, t.out_value, &agg, network, csv_e, fee_rate)?;

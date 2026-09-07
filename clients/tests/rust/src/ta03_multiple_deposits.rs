@@ -168,7 +168,7 @@ async fn four_deposits(client_config: &ClientConfig, wallet1: &Wallet, amounts: 
 
 async fn duplicates_cannot_be_conveyed_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet)  -> Result<()> {
 
-    let (deposit_address, statechain_id) = four_deposits(client_config, wallet1, [1000, 2000, 2000, 1000]).await?;
+    let (deposit_address, statechain_id) = four_deposits(client_config, wallet1, [10000, 20000, 20000, 10000]).await?;
     let trigger = mercuryrustlib::tesr::load(client_config, &wallet1.name, &statechain_id).await?.unwrap().trigger.txid;
 
     let wallet2_transfer_adress = mercuryrustlib::transfer_receiver::new_transfer_address(&client_config, &wallet2.name).await?;
@@ -256,7 +256,7 @@ async fn duplicates_cannot_be_conveyed_workflow(client_config: &ClientConfig, wa
 
 async fn unconfirmed_duplicate_workflow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
 
-    let amount = 1000;
+    let amount = 10000;
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
@@ -266,11 +266,11 @@ async fn unconfirmed_duplicate_workflow(client_config: &ClientConfig, wallet1: &
 
     deposit(amount, &client_config, &deposit_address).await?;
 
-    let amount = 1000;
+    let amount = 10000;
 
     deposit(amount, &client_config, &deposit_address).await?;
 
-    let amount = 2000;
+    let amount = 20000;
 
     let _ = bitcoin_core::sendtoaddress(amount, &deposit_address)?;
 
@@ -285,8 +285,8 @@ async fn unconfirmed_duplicate_workflow(client_config: &ClientConfig, wallet1: &
     let wallet1: mercuryrustlib::Wallet = mercuryrustlib::sqlite_manager::get_wallet(&client_config.pool, &wallet1.name).await?;
 
     let new_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(deposit_address.clone()) && coin.duplicate_index == 0 && coin.status == CoinStatus::CONFIRMED);
-    let confirmed_duplicated_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(deposit_address.clone()) && coin.status == CoinStatus::DUPLICATED && coin.amount == Some(1000));
-    let unconfirmed_duplicated_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(deposit_address.clone()) && coin.status == CoinStatus::DUPLICATED && coin.amount == Some(2000));
+    let confirmed_duplicated_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(deposit_address.clone()) && coin.status == CoinStatus::DUPLICATED && coin.amount == Some(10000));
+    let unconfirmed_duplicated_coin = wallet1.coins.iter().find(|&coin| coin.aggregated_address == Some(deposit_address.clone()) && coin.status == CoinStatus::DUPLICATED && coin.amount == Some(20000));
 
     assert!(new_coin.is_some());
     assert!(confirmed_duplicated_coin.is_some());

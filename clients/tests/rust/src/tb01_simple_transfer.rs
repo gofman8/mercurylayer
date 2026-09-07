@@ -124,7 +124,7 @@ async fn sucessfully_transfer(client_config: &ClientConfig, wallet1: &Wallet, wa
 
     let token_id = crate::utils::handle_token_response(client_config, &token_response).await?;
 
-    let amount = 1000;
+    let amount = 10000;
 
     let address = mercuryrustlib::deposit::get_deposit_bitcoin_address(&client_config, &wallet1.name, &token_id, amount).await?;
 

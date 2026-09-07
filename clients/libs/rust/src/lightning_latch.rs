@@ -7,19 +7,24 @@ use serde::{Deserialize, Serialize};
 /// The row of `wallet` to act on for `statechain_id`.
 ///
 /// A statechain id can sit on several rows of one wallet (a coin re-received after an earlier hop
-/// keeps its older TRANSFERRED row beside the live one). The rows used to be told apart by
-/// locktime; a coin carries no absolute locktime any more — its ladder is its only exit material —
-/// so the LIVE row (CONFIRMED or IN_TRANSFER) is preferred, and with none the first row is returned
-/// so the caller's own status check names what it found.
+/// keeps its older row beside the live one). The rows used to be told apart by locktime — each
+/// hop's backup was lower, so the newest row was the minimum — and a coin carries no absolute
+/// locktime any more, so the choice is made on status and order instead: CONFIRMED before
+/// IN_TRANSFER (a row being sent away is not the row to act on, and its auth key is the one being
+/// rotated away from), and within a status the LAST match, because `wallet.coins` is append-ordered
+/// and a re-received coin's fresh row is the later one. Picking the earlier row hands the
+/// coordinator a stale auth key and earns a 401. With no match the last row is returned so the
+/// caller's own status check names what it found.
 fn coin_row_index(wallet: &mercurylib::wallet::Wallet, statechain_id: &str) -> Option<usize> {
     let sid = |c: &mercurylib::wallet::Coin| c.statechain_id.as_deref() == Some(statechain_id);
     wallet
         .coins
         .iter()
-        .position(|c| {
-            sid(c) && (c.status == CoinStatus::CONFIRMED || c.status == CoinStatus::IN_TRANSFER)
+        .rposition(|c| sid(c) && c.status == CoinStatus::CONFIRMED)
+        .or_else(|| {
+            wallet.coins.iter().rposition(|c| sid(c) && c.status == CoinStatus::IN_TRANSFER)
         })
-        .or_else(|| wallet.coins.iter().position(sid))
+        .or_else(|| wallet.coins.iter().rposition(sid))
 }
 
 #[derive(Serialize, Deserialize)]

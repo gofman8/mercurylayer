@@ -68,7 +68,7 @@ async fn assert_flat_broadcast_refused(client_config: &ClientConfig, wallet_name
 
 async fn w1_transfer_to_w2(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
 
-    let amount = 1000;
+    let amount = 10000;
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 

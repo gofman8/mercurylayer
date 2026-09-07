@@ -6,7 +6,7 @@ use crate::{bitcoin_core, electrs};
 
 pub async fn tb03(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet, wallet3: &Wallet, wallet4: &Wallet) -> Result<()> {
 
-    let amount = 1000;
+    let amount = 10000;
 
     // Create first deposit address
 

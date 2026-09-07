@@ -25,6 +25,45 @@ async fn get_deposit_bitcoin_address_inner(client_config: &ClientConfig, wallet_
     let token_id = uuid::Uuid::parse_str(&token_id)?;
     // println!("Deposit: {} {} {}", wallet_name, token_id, amount);
     let wallet = get_wallet(&client_config.pool, &wallet_name).await?;
+
+    // ═══ REFUSE AN UNFUNDABLE DEPOSIT BEFORE THE USER SENDS ANYTHING ═══
+    //
+    // A coin's only exit material is its TES-R ladder, and the ladder is established at first sight
+    // of this deposit. A deposit too small to fund three tiers therefore cannot become a usable
+    // coin: `tesr::establish` refuses it (before any co-signature, deliberately), the coin is never
+    // booked, and the satoshis sit at an address only a cooperative withdrawal could reach. Issuing
+    // an address for such an amount invites exactly that, so the amount is checked HERE, where
+    // refusing costs the user nothing but a corrected number.
+    //
+    // The floor is the builder's own (`mercurylib::tesr::ladder_floor`), not a second constant to
+    // drift from it. A token onboarding pays the same floor; a carrier's coloured ladder costs more
+    // still and is gated separately by `colored_ladder_floor`.
+    {
+        // `for_network` PANICS on an unrecognised name. This is the first thing a deposit touches,
+        // and a panic here would take the caller down instead of telling it what is wrong, so the
+        // checked variant is used and an unknown network is a named refusal.
+        let p = mercurylib::tesr::TesrParams::for_network_checked(&wallet.network).ok_or_else(|| {
+            anyhow!(
+                "unknown network {:?}: refusing to issue a deposit address, because the TES-R \
+                 schedule that sizes the coin's ladder cannot be resolved for it.",
+                wallet.network
+            )
+        })?;
+        let floor = mercurylib::tesr::ladder_floor(p.committed_fee_rate, mercurylib::tesr::DUST_LIMIT);
+        if (amount as u64) < floor {
+            return Err(anyhow!(
+                "a deposit of {amount} sat cannot be laddered: a TES-R ladder costs {floor} sat at \
+                 {} sat/vB (three tiers, each burning a committed fee plus the {} sat anchor, and a \
+                 final state output that still clears the {} sat dust floor), and a coin without a \
+                 ladder has no exit material at all. Refusing to issue a deposit address for an \
+                 amount that could never become a usable coin — deposit at least {floor} sat.",
+                p.committed_fee_rate,
+                mercurylib::tesr::P2A_VALUE,
+                mercurylib::tesr::DUST_LIMIT
+            ));
+        }
+    }
+
     let mut wallet = init(&client_config, &wallet, token_id, single_use, epoch_deadline).await?;
 
     let coin = wallet.coins.last_mut().unwrap();

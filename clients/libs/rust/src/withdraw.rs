@@ -24,29 +24,41 @@ pub async fn execute(client_config: &ClientConfig, wallet_name: &str, statechain
     let qt_backup_tx: u32 = 0;
 
     // A statechain id can sit on several rows of one wallet: a coin sent to oneself, or one
-    // re-received after an earlier hop, keeps its older TRANSFERRED row beside the live one. The
-    // rows used to be told apart by locktime (the newest backup was the lowest). A coin carries no
-    // absolute locktime any more — its ladder is its only exit material — so the LIVE row
-    // (CONFIRMED or IN_TRANSFER) is preferred outright; with none, the first non-duplicate row is
-    // taken so the status check below names what was found.
+    // re-received after an earlier hop, keeps its older row beside the live one. The rows used to
+    // be told apart by LOCKTIME — each hop's backup was lower, so the newest row was the minimum.
+    // A coin carries no absolute locktime any more (its ladder is its only exit material), so that
+    // tie-break is gone and the row has to be chosen on what is actually known about it.
+    //
+    // Two rules, in order, and BOTH matter:
+    //   * CONFIRMED before IN_TRANSFER. A row this wallet is in the middle of sending away is not
+    //     the row to withdraw, and its auth key is the one being rotated away from.
+    //   * within a status, the LAST matching row. `wallet.coins` is append-ordered, so a coin
+    //     re-received after being sent keeps its stale outgoing row FIRST and its fresh row last.
+    //     Taking the first live row instead hands `sign/first` the old auth key and the coordinator
+    //     answers 401 "Signature does not match authentication key" — measured on tb02, whose
+    //     step 8 withdraws a coin the wallet sent and then received back without an intervening
+    //     status refresh, so the outgoing row is still IN_TRANSFER at that moment.
     let sid_matches =
         |c: &mercurylib::wallet::Coin| c.statechain_id.as_deref() == Some(statechain_id);
     let coin_index: Option<usize> = match duplicated_index {
-        Some(index) => wallet.coins.iter().position(|c| {
+        Some(index) => wallet.coins.iter().rposition(|c| {
             sid_matches(c) && c.status == CoinStatus::DUPLICATED && c.duplicate_index == index
         }),
         None => wallet
             .coins
             .iter()
-            .position(|c| {
-                sid_matches(c)
-                    && (c.status == CoinStatus::CONFIRMED || c.status == CoinStatus::IN_TRANSFER)
+            .rposition(|c| sid_matches(c) && c.status == CoinStatus::CONFIRMED)
+            .or_else(|| {
+                wallet
+                    .coins
+                    .iter()
+                    .rposition(|c| sid_matches(c) && c.status == CoinStatus::IN_TRANSFER)
             })
             .or_else(|| {
                 wallet
                     .coins
                     .iter()
-                    .position(|c| sid_matches(c) && c.status != CoinStatus::DUPLICATED)
+                    .rposition(|c| sid_matches(c) && c.status != CoinStatus::DUPLICATED)
             }),
     };
     let coin: Option<&mut mercurylib::wallet::Coin> = coin_index.map(|i| &mut wallet.coins[i]);

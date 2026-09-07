@@ -113,7 +113,7 @@ async fn stage_duplicate(
 async fn withdraw_flow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
     let core_wallet_address = bitcoin_core::getnewaddress()?;
     let (_deposit_address, statechain_id) =
-        stage_duplicate(client_config, wallet1, &core_wallet_address, 1000, 2000).await?;
+        stage_duplicate(client_config, wallet1, &core_wallet_address, 10000, 20000).await?;
     let statechain_id = statechain_id.as_str();
 
     let wallet2_transfer_adress =
@@ -214,7 +214,7 @@ async fn withdraw_flow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: 
 async fn transfer_flow(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet) -> Result<()> {
     let core_wallet_address = bitcoin_core::getnewaddress()?;
     let (deposit_address, statechain_id) =
-        stage_duplicate(client_config, wallet1, &core_wallet_address, 1000, 2000).await?;
+        stage_duplicate(client_config, wallet1, &core_wallet_address, 10000, 20000).await?;
     let statechain_id = statechain_id.as_str();
 
     let wallet2_transfer_adress =

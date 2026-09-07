@@ -6,7 +6,7 @@ use crate::{bitcoin_core, electrs};
 
 async fn tm01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet, wallet3: &Wallet) -> Result<()> {
 
-    let amount = 1000;
+    let amount = 10000;
 
     let token_response = mercuryrustlib::deposit::get_token(client_config).await?;
 
@@ -155,14 +155,32 @@ async fn tm01(client_config: &ClientConfig, wallet1: &Wallet, wallet2: &Wallet, 
          SC={statechain_id}, so re-conveying it to wallet2 is theft of a spent coin. It was accepted."
     );
     let err = result.err().unwrap().to_string();
+    // **THE REFUSAL MOVED EARLIER, AND THE TEST FOLLOWS IT.** This used to reach the coordinator
+    // and fail there: wallet3's receive rotates the coin's authentication key, so wallet1 can no
+    // longer authenticate. That is still true, but wallet1 no longer gets that far. Since the
+    // ladder is established at first sight of the deposit, wallet1's coin now HAS a `tesr-` bundle,
+    // and the bundle records the receiver-paying state it co-signed for wallet3 as an OUTSTANDING
+    // CONVEYED state. Building another state over the same outpoint is refused locally, by name,
+    // before anything is co-signed or sent.
+    //
+    // Both refusals prove the same property — wallet1 cannot move a coin it has handed over — and
+    // the local one is strictly better, because it costs no round trip and no signature. So either
+    // is accepted, and ONLY those two: the point of the assertion is that a stack that is simply
+    // down must not make this test green.
+    let by_auth = err.contains("Signature does not match authentication key");
+    let by_outstanding = err.contains("outstanding conveyed state");
     assert!(
-        err.contains("Signature does not match authentication key"),
-        "TM01 - [3] refused, but for the WRONG reason. The refusal must come from the auth-key check \
-         — wallet3's receive rotated the coin's authentication key, so wallet1 can no longer \
-         authenticate against it. Any other error (server unreachable, database locked, timeout) \
-         means this test passed without exercising the property at all. Got: {err}"
+        by_auth || by_outstanding,
+        "TM01 - [3] refused, but for the WRONG reason. It must be refused either LOCALLY, because \
+         wallet1's ladder still records the state it conveyed to wallet3 as outstanding, or by the \
+         coordinator, because wallet3's receive rotated the authentication key. Any other error \
+         (server unreachable, database locked, timeout) means this test passed without exercising \
+         the property at all. Got: {err}"
     );
-    println!("TM01 - [3] stale-key double spend REFUSED as expected: {err}");
+    println!(
+        "TM01 - [3] double spend REFUSED as expected, {}: {err}",
+        if by_outstanding { "locally, on the outstanding conveyed state" } else { "by the coordinator's auth-key check" }
+    );
 
     // If we update wallet1, the error will happen when we try to send the coin to wallet2
     // The step above tested that the sender can double spend the coin, but the server will not accept it
